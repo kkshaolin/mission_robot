@@ -62,12 +62,10 @@ def move_chassis(ep_chassis):
 
         now = time.time()
         if ir_right_cm < 10 and now - last_avoid_time > 1:
-            print("📌 Avoiding RIGHT wall → move left")
             ep_chassis.drive_speed(x=0, y=-0.05, z=0, timeout=1)  # วิ่งออกซ้าย
             time.sleep(0.5)
             last_avoid_time = now
         elif ir_left_cm < 10 and now - last_avoid_time > 1:
-            print("📌 Avoiding LEFT wall → move right")
             ep_chassis.drive_speed(x=0, y=0.05, z=0, timeout=1)  # วิ่งออกขวา
             time.sleep(0.5)
             last_avoid_time = now
