@@ -37,7 +37,7 @@ IR_WALL_THRESHOLD_CM = 29   # ถ้า IR วัดได้มากกว่�
 
 # ค่าคงที่สำหรับระบบ DFS และการเคลื่อนที่
 START_CELL = (0, 0)      #  จุดเริ่ม
-MAP_BOUNDS = (3, 3)      #  ขนาน map
+MAP_BOUNDS = (3, 3)      #  ขนาด map
 NODE_DISTANCE = 0.6      # โหนดในเขาวงกต (60 cm)
 
 # --------------------------------------------------------
@@ -64,7 +64,7 @@ path_stack = []  # Stack เก็บเส้นทางที่เดิน�
 visited_nodes = set()  # Set เก็บโหนดที่เคยไปแล้ว (ป้องกันไปซ้ำ)
 current_pos = (0, 0)  # ตำแหน่งปัจจุบันในระบบพิกัด (x, y)
 current_heading_degrees = 0  # ทิศทางที่หุ่นยนต์หันไป (0=เหนือ, 90=ตะวันออก, -90=ตะวันตก, 180=ใต้)
-
+walls = {} # เก็บข้อมูลกำแพงที่ตรวจพบ {(cell1, cell2): 'Occupied'/'Free'}
 
 # WALL_THRESHOLD = 50
 # CELL_SIZE = 0.60
@@ -283,6 +283,68 @@ def normalize_angle(angle):
         angle += 360  # ถ้าน้อยกว่าหรือเท่ากับ -180 ให้บวก 360
     return angle
 
+def plot_maze(walls_to_plot, cell_to_plot, visited_to_plot, title="Maze Exploration"):
+    _ax.clear()
+    MAZE_BOUNDS_PLOT = (0, 5, 0, 5) # สามารถปรับขนาดตามแผนที่จริงได้
+    x_min, x_max = MAZE_BOUNDS_PLOT[0]-1, MAZE_BOUNDS_PLOT[1]+1
+    y_min, y_max = MAZE_BOUNDS_PLOT[2]-1, MAZE_BOUNDS_PLOT[3]+1
+    for x, y in visited_to_plot:
+        _ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor='lightcyan', edgecolor='none', zorder=0))
+    for wall in walls_to_plot.keys():
+        (x1, y1), (x2, y2) = wall
+        if y1 == y2: # Vertical wall
+            x_mid = (x1 + x2) / 2.0
+            _ax.plot([x_mid, x_mid], [y1 - 0.5, y1 + 0.5], color='k', linewidth=4)
+        elif x1 == x2: # Horizontal wall
+            y_mid = (y1 + y2) / 2.0
+            _ax.plot([x1 - 0.5, x1 + 0.5], [y_mid, y_mid], color='k', linewidth=4)
+    cx, cy = cell_to_plot
+    _ax.plot(cx, cy, 'bo', markersize=15, label='Robot', zorder=2)
+    _ax.set_xlim(x_min - 0.5, x_max + 0.5); _ax.set_ylim(y_min - 0.5, y_max + 0.5)
+    _ax.set_aspect('equal', adjustable='box'); _ax.grid(True, which='both', color='lightgray', linestyle='-', linewidth=0.5)
+    _ax.set_xticks(np.arange(x_min - 0.5, x_max + 1.5, 1)); _ax.set_yticks(np.arange(y_min - 0.5, y_max + 1.5, 1))
+    _ax.set_xticklabels([]); _ax.set_yticklabels([])
+    _ax.set_title(title)
+
+def finalize_show():
+    plt.ioff() # ปิดโหมด Interactive
+    plt.show() # แสดงผลแบบค้างไว้
+
+def _get_discretized_orientation(yaw_deg):
+    """แปลงมุมองศาเป็นทิศทางแบบตัวเลข (0:N, 1:E, 2:S, 3:W)"""
+    # 90 คือ East, -90 คือ West
+    if -45 <= yaw_deg < 45: return 0      # North (หันหน้าไปทาง +y)
+    elif 45 <= yaw_deg < 135: return 1     # East (หันหน้าไปทาง +x)
+    elif abs(yaw_deg) >= 135: return 2   # South (หันหน้าไปทาง -y)
+    elif -135 < yaw_deg < -45: return 3   # West (หันหน้าไปทาง -x)
+
+def update_map_and_walls(cell, orientation, scan_results, current_walls):
+    """
+    อัปเดตข้อมูลกำแพง (walls) จากผลการสแกนล่าสุด
+    """
+    updated_walls = current_walls.copy()
+    
+    # แปลงทิศทางของหุ่นยนต์ (0-3) ไปเป็นทิศของกำแพง (L, F, R)
+    # 0:N -> L=W(3), F=N(0), R=E(1)
+    orientation_map = {0:{"left":3,"front":0,"right":1}, 1:{"left":0,"front":1,"right":2}, 2:{"left":1,"front":2,"right":3}, 3:{"left":2,"front":3,"right":0}}
+    
+    # แปลงทิศทาง (0-3) เป็นการเปลี่ยนแปลงของแกน (dx, dy)
+    coord_map = {0:(0,1), 1:(1,0), 2:(0,-1), 3:(-1,0)}
+    
+    # ตรวจสอบผลสแกนแต่ละทิศทาง
+    for move_key in ["left", "front", "right"]:
+        # ถ้าผลสแกนคือ False แปลว่ามีกำแพง
+        if not scan_results.get(move_key, True):
+            direction = orientation_map[orientation][move_key]
+            dx, dy = coord_map[direction]
+            neighbor_cell = (cell[0] + dx, cell[1] + dy)
+            
+            # สร้าง key สำหรับ dictionary ของกำแพง โดยเรียงลำดับ tuple เสมอ
+            wall_coords = tuple(sorted((cell, neighbor_cell)))
+            updated_walls[wall_coords] = 'Wall'
+            
+    return updated_walls
+
 # --- ฟังก์ชันควบคุมการเคลื่อนที่ (ไม่มีการเปลี่ยนแปลง) ---
 def turn_to_angle(ep_chassis, ep_gimbal, target_angle):
     """
@@ -431,6 +493,9 @@ if __name__ == '__main__':
     ep_robot = robot.Robot()
     ep_robot.initialize(conn_type="ap")
 
+    _fig, _ax = plt.subplots(figsize=(6, 6))
+    _fig.canvas.manager.set_window_title("Maze Map")
+
     ep_chassis = ep_robot.chassis  
     ep_sensor = ep_robot.sensor 
     ep_gimbal = ep_robot.gimbal
@@ -460,6 +525,18 @@ if __name__ == '__main__':
             # สแกนสภาพแวดล้อมรอบตัว
             scan_results = scan_environment()
             print(scan_results)
+
+            try:
+                # 1. แปลงมุมองศาเป็นทิศทาง 0-3
+                discrete_orientation = _get_discretized_orientation(current_heading_degrees)
+                # 2. อัปเดตข้อมูลกำแพงจากผลสแกน
+                walls = update_map_and_walls(current_pos, discrete_orientation, scan_results, walls)
+                # 3. วาดแผนที่ล่าสุด
+                plot_maze(walls, current_pos, visited_nodes, "Real-time Maze Exploration")
+                # 4. อัปเดตหน้าต่างแสดงผล
+                plt.pause(0.01)
+            except Exception as e:
+                print(f"Error plotting: {e}")
             
             chosen = decide_by_dfs(scan_results, current_pos, current_heading_degrees)
             # if chosen:
@@ -492,8 +569,8 @@ if __name__ == '__main__':
     ep_sensor.unsub_distance() 
     ep_chassis.unsub_attitude()  
     ep_robot.close()
-    # plot_maze(walls, path_stack[-1], visited, "Final Exploration Map")
-    # _fig.savefig("final_maze_map.png", dpi=300)
-    # finalize_show()
+    plot_maze(walls, current_pos, visited_nodes, "Final Exploration Map")
+    _fig.savefig("final_maze_map.png", dpi=300)
+    finalize_show()
         
     # print("โปรแกรมปิดตัวลงเรียบร้อย")
