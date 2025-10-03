@@ -34,21 +34,19 @@ SCAN_DURATION_S = 0.2  # เวลารอเพื่อให้ค่าเ�
 TOF_WALL_THRESHOLD_CM = 60  # ถ้า ToF วัดได้มากกว่านี้ = ทางเปิด
 IR_WALL_THRESHOLD_CM = 29   # ถ้า IR วัดได้มากกว่านี้ = ทางเปิด
 
+START_CELL = (1, 1)              #  จุดเริ่ม สามารถเปลี่ยนเป็นพิกัดอื่นได้ เช่น (1, 1) หรือ (-2, -2)
+MAP_MIN_BOUNDS = (1, 1)          #  พิกัด (min_x, min_y) ของแผนที่ (มุมซ้ายล่าง)
+MAP_MAX_BOUNDS = (3, 3)          #  พิกัด (max_x, max_y) ของแผนที่ (มุมขวาบน)
+NODE_DISTANCE = 0.6              # โหนดในเขาวงกต (60 cm)
 
-# ค่าคงที่สำหรับระบบ DFS และการเคลื่อนที่
-START_CELL = (0, 0)      #  จุดเริ่ม
-MAP_BOUNDS = (3, 3)      #  ขนาน map
-NODE_DISTANCE = 0.6      # โหนดในเขาวงกต (60 cm)
-
-# --------------------------------------------------------
 
 WALL_AVOID_THRESHOLD_CM = 10.0  # ถ้า IR วัดได้น้อยกว่านี้ = ใกล้กำแพงเกินไป ต้องขยับหนี
 WALL_AVOID_SPEED_Y = 0.05    # ความเร็วในการขยับหนีกำแพง (m/s) ในแนวแกน Y (ซ้าย-ขวา)
-
-MOVE_SPEED_X = 0.2  # ความเร็วในการเดินหน้า (m/s)
+MOVE_SPEED_X = 1  # ความเร็วในการเดินหน้า (m/s)
 TURN_SPEED_Z = 60  # ความเร็วสูงสุดในการหมุน (degrees/s)
 
-# ค่าคงที่สำหรับ PID Controller
+# --------------------------------------------------------
+
 # PID สำหรับการหมุน (Turn)
 Kp_turn = 2.5  # Proportional gain สำหรับการหมุน (ยิ่งสูงยิ่งตอบสนองเร็ว)
 
@@ -62,12 +60,75 @@ last_error_straight = 0.0  # ตัวแปรเก็บค่า error ค�
 # โครงสร้างข้อมูลสำหรับ DFS (Depth-First Search)
 path_stack = []  # Stack เก็บเส้นทางที่เดินมา (สำหรับ backtracking)
 visited_nodes = set()  # Set เก็บโหนดที่เคยไปแล้ว (ป้องกันไปซ้ำ)
-current_pos = (0, 0)  # ตำแหน่งปัจจุบันในระบบพิกัด (x, y)
+current_pos = START_CELL  # ตำแหน่งปัจจุบันในระบบพิกัด (x, y)
 current_heading_degrees = 0  # ทิศทางที่หุ่นยนต์หันไป (0=เหนือ, 90=ตะวันออก, -90=ตะวันตก, 180=ใต้)
-
+walls = {} # เก็บข้อมูลกำแพงที่ตรวจพบ {(cell1, cell2): 'Occupied'/'Free'}
 
 # WALL_THRESHOLD = 50
 # CELL_SIZE = 0.60
+"""-----------------------map-------------"""
+def plot_maze(walls_to_plot, cell_to_plot, visited_to_plot, title="Maze Exploration"):
+    _ax.clear()
+    MAZE_BOUNDS_PLOT = (0, 5, 0, 5) # สามารถปรับขนาดตามแผนที่จริงได้
+    x_min, x_max = MAZE_BOUNDS_PLOT[0]-1, MAZE_BOUNDS_PLOT[1]+1
+    y_min, y_max = MAZE_BOUNDS_PLOT[2]-1, MAZE_BOUNDS_PLOT[3]+1
+    for x, y in visited_to_plot:
+        _ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor='lightcyan', edgecolor='none', zorder=0))
+    for wall in walls_to_plot.keys():
+        (x1, y1), (x2, y2) = wall
+        if y1 == y2: # Vertical wall
+            x_mid = (x1 + x2) / 2.0
+            _ax.plot([x_mid, x_mid], [y1 - 0.5, y1 + 0.5], color='k', linewidth=4)
+        elif x1 == x2: # Horizontal wall
+            y_mid = (y1 + y2) / 2.0
+            _ax.plot([x1 - 0.5, x1 + 0.5], [y_mid, y_mid], color='k', linewidth=4)
+    cx, cy = cell_to_plot
+    _ax.plot(cx, cy, 'bo', markersize=15, label='Robot', zorder=2)
+    _ax.set_xlim(x_min - 0.5, x_max + 0.5); _ax.set_ylim(y_min - 0.5, y_max + 0.5)
+    _ax.set_aspect('equal', adjustable='box'); _ax.grid(True, which='both', color='lightgray', linestyle='-', linewidth=0.5)
+    _ax.set_xticks(np.arange(x_min - 0.5, x_max + 1.5, 1)); _ax.set_yticks(np.arange(y_min - 0.5, y_max + 1.5, 1))
+    _ax.set_xticklabels([]); _ax.set_yticklabels([])
+    _ax.set_title(title)
+
+def finalize_show():
+    plt.ioff() # ปิดโหมด Interactive
+    plt.show() # แสดงผลแบบค้างไว้
+
+def _get_discretized_orientation(yaw_deg):
+    """แปลงมุมองศาเป็นทิศทางแบบตัวเลข (0:N, 1:E, 2:S, 3:W)"""
+    # 90 คือ East, -90 คือ West
+    if -45 <= yaw_deg < 45: return 0      # North (หันหน้าไปทาง +y)
+    elif 45 <= yaw_deg < 135: return 1     # East (หันหน้าไปทาง +x)
+    elif abs(yaw_deg) >= 135: return 2   # South (หันหน้าไปทาง -y)
+    elif -135 < yaw_deg < -45: return 3   # West (หันหน้าไปทาง -x)
+
+def update_map_and_walls(cell, orientation, scan_results, current_walls):
+    """
+    อัปเดตข้อมูลกำแพง (walls) จากผลการสแกนล่าสุด
+    """
+    updated_walls = current_walls.copy()
+    
+    # แปลงทิศทางของหุ่นยนต์ (0-3) ไปเป็นทิศของกำแพง (L, F, R)
+    # 0:N -> L=W(3), F=N(0), R=E(1)
+    orientation_map = {0:{"left":3,"front":0,"right":1}, 1:{"left":0,"front":1,"right":2}, 2:{"left":1,"front":2,"right":3}, 3:{"left":2,"front":3,"right":0}}
+    
+    # แปลงทิศทาง (0-3) เป็นการเปลี่ยนแปลงของแกน (dx, dy)
+    coord_map = {0:(0,1), 1:(1,0), 2:(0,-1), 3:(-1,0)}
+    
+    # ตรวจสอบผลสแกนแต่ละทิศทาง
+    for move_key in ["left", "front", "right"]:
+        # ถ้าผลสแกนคือ False แปลว่ามีกำแพง
+        if not scan_results.get(move_key, True):
+            direction = orientation_map[orientation][move_key]
+            dx, dy = coord_map[direction]
+            neighbor_cell = (cell[0] + dx, cell[1] + dy)
+            
+            # สร้าง key สำหรับ dictionary ของกำแพง โดยเรียงลำดับ tuple เสมอ
+            wall_coords = tuple(sorted((cell, neighbor_cell)))
+            updated_walls[wall_coords] = 'Wall'
+            
+    return updated_walls
+"""------------------------end map-------------------------"""
 
 # --- ฟังก์ชัน Callback สำหรับ ToF และ IMU (ยังใช้เหมือนเดิม) ---
 def sub_tof_handler(sub_info):
@@ -238,33 +299,27 @@ def get_new_pos_and_heading(direction, old_pos, old_heading):
 
 def decide_by_dfs(scan_results, current_pos, current_heading):
     """ฟังก์ชันตัดสินใจเลือกทิศทางการเดินโดยใช้หลักการ DFS (Depth-First Search)
-       เพิ่มการตรวจสอบ MAZE_BOUNDS เพื่อป้องกันการออกนอกแผนที่"""
-    global MAP_BOUNDS
-    max_x, max_y = MAP_BOUNDS
+       ใช้ MAP_MIN_BOUNDS และ MAP_MAX_BOUNDS เพื่อป้องกันการออกนอกแผนที่"""
+    global MAP_MIN_BOUNDS, MAP_MAX_BOUNDS  # เรียกใช้ค่าคงที่ตัวใหม่
+    min_x, min_y = MAP_MIN_BOUNDS
+    max_x, max_y = MAP_MAX_BOUNDS
     
-    # สร้างลิสต์เปล่าสำหรับเก็บทิศทางที่สามารถเดินได้
     possible_moves = []
-
-    # กำหนดลำดับการตรวจสอบทิศทาง: ซ้าย -> หน้า -> ขวา
     check_order = ['left', 'front', 'right']
 
-    # วนลูปตรวจสอบแต่ละทิศทางตามลำดับที่กำหนด
     for direction in check_order:
-        if scan_results.get(direction, False):  # ตรวจสอบว่าทิศทางนั้นสามารถเดินได้หรือไม่ (ไม่มีกำแพงขวาง)
-            # คำนวณตำแหน่งใหม่และทิศทางหัวหุ่นยนต์หลังจากเดินไปในทิศทางนั้น
+        if scan_results.get(direction, False):
             pos, _ = get_new_pos_and_heading(direction, current_pos, current_heading)
             x, y = pos
 
-            # ตรวจสอบว่าอยู่ในขอบเขตแผนที่หรือไม่
-            if 0 <= x <= max_x and 0 <= y <= max_y:
-                # ตรวจสอบว่าตำแหน่งใหม่นั้นเคยไปแล้วหรือยัง
+            # ตรวจสอบว่าอยู่ในขอบเขตแผนที่หรือไม่ (ใช้ min และ max)
+            if min_x <= x <= max_x and min_y <= y <= max_y:
                 if pos not in visited_nodes:
-                    possible_moves.append(direction)  # เพิ่มทิศทางนี้เข้าไปในลิสต์ของทางเลือกที่เป็นไปได้
+                    possible_moves.append(direction)
 
-    # คืนค่า: ทิศทางที่เลือก (string) หรือ None ถ้าไม่มีทางเดิน
     if possible_moves:
-        return possible_moves[0]  # เลือกทางแรกในลิสต์
-    return None  # (ทุกทางถูกปิด เคยไปแล้ว หรืออยู่นอกขอบเขต)
+        return possible_moves[0]
+    return None
 
 
 # --- ฟังก์ชันช่วย (Helper Functions) ---
@@ -285,28 +340,18 @@ def normalize_angle(angle):
 
 # --- ฟังก์ชันควบคุมการเคลื่อนที่ (ไม่มีการเปลี่ยนแปลง) ---
 def turn_to_angle(ep_chassis, ep_gimbal, target_angle):
-    """
-    หมุนหุ่นยนต์ไปยังมุมที่ต้องการโดยใช้ PID แบบ Proportional
-    
-    Parameters:
-        ep_chassis: object สำหรับควบคุมการเคลื่อนที่
-        ep_gimbal: object สำหรับควบคุม gimbal (กล้อง)
-        target_angle: มุมเป้าหมาย (degrees)
-    """
+    """หมุนหุ่นยนต์ไปยังมุมที่ต้องการโดยใช้ PID แบบ Proportional"""
     global current_yaw
-    
     
     # Normalize มุมเป้าหมาย
     target_angle = normalize_angle(target_angle)
-    print(f"กำลังหมุนไปที่ {target_angle:.1f}°...")
+    print(f"หมุน{target_angle}°")
     
-    # Loop จนกว่าจะหมุนถึงมุมเป้าหมาย (ยอมรับ error ±2°)
-    while not stop_flag:
+    while not stop_flag:    # Loop จนกว่าจะหมุนถึงมุมเป้าหมาย (ยอมรับ error ±2°)
         # คำนวณความแตกต่างของมุม (error)
         angle_error = normalize_angle(target_angle - current_yaw)
         
-        # ถ้า error น้อยกว่า 2° ถือว่าหมุนสำเร็จแล้ว
-        if abs(angle_error) < 2.0: 
+        if abs(angle_error) < 2.0:  # ถ้า error น้อยกว่า 2° ถือว่าหมุนสำเร็จแล้ว
             break
         
         # คำนวณความเร็วการหมุนด้วย P-controller
@@ -324,105 +369,121 @@ def turn_to_angle(ep_chassis, ep_gimbal, target_angle):
     ep_gimbal.moveto(pitch=0, yaw=0, pitch_speed=100, yaw_speed=100)
     
     time.sleep(0.5)  # รอให้หุ่นยนต์หยุดนิ่ง
-    print(f"หมุนสำเร็จ! มุมปัจจุบัน: {current_yaw:.1f}°")
 
 # --- อัปเดต: ฟังก์ชันเดินตรง ให้ใช้ตัวแปร ir_left_cm, ir_right_cm ---
 def move_straight_60cm(ep_chassis, target_yaw):
     """
-    เดินหน้าตรงไป 60 cm พร้อมใช้ PID รักษาทิศทางและหลบกำแพง
-    
-    Features:
-    1. PID Controller (แกน Z) - รักษาทิศทางให้ตรง
-    2. Wall Avoidance (แกน Y) - ขยับหนีกำแพงถ้าเข้าใกล้เกินไป
-    
+    เดินหน้าตรงไป 60 cm โดยใช้ PID ควบคุม:
+      - แกน X: ระยะทาง (PID คุมให้เดิน 60 cm)
+      - แกน Z: รักษาทิศทาง (PID คุม yaw)
+      - แกน Y: หลีกเลี่ยงกำแพง (Rule-based)
+
     Parameters:
-        ep_chassis: object สำหรับควบคุมการเคลื่อนที่
-        target_yaw: มุมเป้าหมายที่ต้องการรักษา (degrees)
+        ep_chassis: object ควบคุมการเคลื่อนที่
+        target_yaw: มุม yaw เป้าหมาย (degrees)
     """
-    global integral_straight, last_error_straight, ir_left_cm, ir_right_cm
-    
-    print(f"กำลังเคลื่อนที่ไปข้างหน้า 60 cm (PID + Wall Avoidance) ที่มุม {target_yaw:.1f}°")
-    
-    # รีเซ็ตตัวแปร PID
-    integral_straight, last_error_straight = 0.0, 0.0
-    
-    # คำนวณเวลาที่ต้องใช้ในการเดิน 60cm
-    # เวลา = ระยะทาง / ความเร็ว, คูณ 1.05 เผื่อเวลาพอเคลื่อนที่ครบ
+    global ir_left_cm, ir_right_cm, current_yaw, stop_flag
+
+    # ===================== PID Parameters =====================
+    # แกน X (เดินไปข้างหน้า)
+    Kp_x, Ki_x, Kd_x = 2.0, 0.0, 0.05
+    tolerance_x = 0.01      # error ที่ยอมรับได้ (m) ≈ 2 cm
+
+    # แกน Z (ทิศทาง yaw)
+    Kp_z, Ki_z, Kd_z = 0.8, 0.02, 0.1
+    tolerance_z = 2.0       # error ที่ยอมรับได้ (°)
+
+    # Wall avoidance (แกน Y)
+    avoid_speed_y = WALL_AVOID_SPEED_Y
+    avoid_threshold_cm = WALL_AVOID_THRESHOLD_CM
+
+    # ===================== Initial Values =====================
+    integral_x, last_error_x = 0.0, 0.0
+    integral_z, last_error_z = 0.0, 0.0
+    traveled_distance = 0.0
+
     start_time = time.time()
     last_time = start_time
-    duration = (NODE_DISTANCE_M / MOVE_SPEED_X) * 1.05
 
-    # Loop เดินไปข้างหน้าจนครบระยะทางหรือได้รับสัญญาณหยุด
-    while (time.time() - start_time) < duration and not stop_flag:
+    # ===================== Main Loop =====================
+    while traveled_distance < NODE_DISTANCE - tolerance_x and not stop_flag:
         current_time = time.time()
-        dt = current_time - last_time  # คำนวณช่วงเวลาที่ผ่านไป
-        
-        # ถ้า dt <= 0 (ไม่น่าจะเกิด แต่ป้องกันการหาร 0)
-        if dt <= 0: 
+        dt = current_time - last_time
+        if dt <= 0:
             time.sleep(0.01)
             continue
-        
-        # === PID Controller สำหรับรักษาทิศทาง (แกน Z) ===
-        # คำนวณ error (ความแตกต่างระหว่างมุมเป้าหมายกับมุมปัจจุบัน)
-        error = normalize_angle(target_yaw - current_yaw)
-        
-        # คำนวณ integral (เก็บสะสม error)
-        integral_straight += error * dt
-        
-        # คำนวณ derivative (อัตราการเปลี่ยนแปลงของ error)
-        derivative = (error - last_error_straight) / dt
-        
-        # คำนวณความเร็วการหมุนด้วย PID
-        z_correct_speed = (Kp_straight * error) + \
-                         (Ki_straight * integral_straight) + \
-                         (Kd_straight * derivative)
-        
-        # === Wall Avoidance สำหรับหลบกำแพง (แกน Y) ===
-        y_correct_speed = 0.0  # เริ่มต้นไม่ขยับซ้าย-ขวา
-        
-        # ถ้าใกล้กำแพงด้านขวาเกินไป → ขยับไปทางซ้าย (y ติดลบ)
-        if ir_right_cm < WALL_AVOID_THRESHOLD_CM: 
-            y_correct_speed -= WALL_AVOID_SPEED_Y
-        
-        # ถ้าใกล้กำแพงด้านซ้ายเกินไป → ขยับไปทางขวา (y บวก)
-        if ir_left_cm < WALL_AVOID_THRESHOLD_CM: 
-            y_correct_speed += WALL_AVOID_SPEED_Y
-        
-        # ส่งคำสั่งเคลื่อนที่:
-        # x = เดินหน้า (ความเร็วคงที่)
-        # y = ขยับซ้าย-ขวา (หลบกำแพง)
-        # z = หมุน (รักษาทิศทาง)
-        ep_chassis.drive_speed(x=MOVE_SPEED_X, y=y_correct_speed, z=z_correct_speed)
-        
-        # เก็บค่า error และเวลาปัจจุบันไว้สำหรับรอบถัดไป
-        last_error_straight, last_time = error, current_time
-        time.sleep(0.02)  # รอ 20ms ก่อนคำนวณใหม่
-    
-    # หยุดการเคลื่อนที่
+
+        # --- PID แกน X (คุมระยะทาง) ---
+        error_x = NODE_DISTANCE - traveled_distance
+        integral_x += error_x * dt
+        derivative_x = (error_x - last_error_x) / dt
+        x_speed = (Kp_x * error_x) + (Ki_x * integral_x) + (Kd_x * derivative_x)
+        x_speed = max(min(x_speed, MOVE_SPEED_X), -MOVE_SPEED_X)
+
+        # --- PID แกน Z (คุม yaw) ---
+        error_z = normalize_angle(target_yaw - current_yaw)
+        integral_z += error_z * dt
+        derivative_z = (error_z - last_error_z) / dt
+        z_speed = (Kp_z * error_z) + (Ki_z * integral_z) + (Kd_z * derivative_z)
+
+        # ถ้า error_z อยู่ใน tolerance → ไม่ต้องหมุน
+        if abs(error_z) < tolerance_z:
+            z_speed = 0.0
+
+        # --- Wall Avoidance (แกน Y) ---
+        y_speed = 0.0
+        if ir_right_cm < avoid_threshold_cm:
+            y_speed -= avoid_speed_y
+        if ir_left_cm < avoid_threshold_cm:
+            y_speed += avoid_speed_y
+
+        # --- ส่งคำสั่งเคลื่อนที่ ---
+        ep_chassis.drive_speed(x=x_speed, y=y_speed, z=z_speed)
+
+        # --- Update States ---
+        traveled_distance += abs(x_speed) * dt
+        last_error_x, last_error_z = error_x, error_z
+        last_time = current_time
+        time.sleep(0.02)
+
+    # ===================== Stop Motion =====================
     ep_chassis.drive_speed(x=0, y=0, z=0)
-    time.sleep(0.5)  # รอให้หุ่นยนต์หยุดนิ่ง
-    print("เคลื่อนที่ 60 cm สำเร็จ")
+    time.sleep(0.5)
+    print(f"เคลื่อนที่ 60 ")
+
+
 
 def backtrack(ep_chassis, ep_gimbal):
     global current_pos, current_heading_degrees
     print("Backtracking...")
-    # pop until we reach a cell that has unexplored neighbour or stack empty
-    while path_stack and not stop_flag:
+    # ตรวจสอบว่ายังมีเส้นทางให้ย้อนกลับหรือไม่
+    if path_stack and not stop_flag:
+        # ดึงตำแหน่งและทิศทางล่าสุดออกจาก stack
         last_pos, last_heading = path_stack.pop()
-        # compute heading from current_pos to last_pos
+        
+        # แยกพิกัดเพื่อคำนวณทิศทาง
         target_x, target_y = last_pos
         current_x, current_y = current_pos
+        
+        # คำนวณมุมที่ต้องหันกลับไปหาโหนดก่อนหน้า
+        # ใช้ atan2(delta_x, delta_y) เพราะ 0 องศาของเราคือแกน Y+ (ทิศเหนือ)
         backtrack_heading = math.degrees(math.atan2(target_x - current_x, target_y - current_y))
         backtrack_heading = normalize_angle(backtrack_heading)
-        print(f"Backtrack: going to {last_pos} heading {backtrack_heading:.1f}")
+        
+        print(f"Backtrack: กำลังกลับจาก {current_pos} ไปยัง {last_pos} ด้วยทิศทาง {backtrack_heading:.1f}°")
+        
+        # หันและเคลื่อนที่กลับไปยังโหนดก่อนหน้า
         turn_to_angle(ep_chassis, ep_gimbal, backtrack_heading)
         move_straight_60cm(ep_chassis, backtrack_heading)
-        # update current pos/heading
+        
+        # อัปเดตตำแหน่งและทิศทางปัจจุบันให้ตรงกับโหนดที่ย้อนกลับมา
         current_pos = last_pos
-        current_heading_degrees = last_heading
-        # after moving back, check if this cell has unexplored neighbor
-        # We'll scan in main loop after returning
+        current_heading_degrees = last_heading # กลับไปใช้ทิศทางเดิมของโหนดนั้น
+        
+        # คืนค่า True เพื่อบอกว่า backtrack สำเร็จ
         return True
+    
+    # ถ้า path_stack ว่างเปล่า (ไม่มีที่ให้ย้อนกลับแล้ว) คืนค่า False
     return False
 
 
@@ -439,6 +500,9 @@ if __name__ == '__main__':
     ep_sensor.sub_distance(freq=20, callback=sub_tof_handler) # Subscribe ToF sensor and IMU (attitude)
     ep_chassis.sub_attitude(freq=20, callback=sub_imu_handler)
     time.sleep(0.5)  # รอให้ subscription เริ่มทำงาน
+
+    _fig, _ax = plt.subplots(figsize=(6, 6))
+    _fig.canvas.manager.set_window_title("Maze Map")
 
     # thread การอ่านค่า IR ---
     ir_reader = threading.Thread(target=read_ir_thread, args=(ep_sensor_adaptor,),daemon=True)
@@ -457,32 +521,45 @@ if __name__ == '__main__':
             # reset gimbal
             ep_gimbal.moveto(pitch=0, yaw=0, pitch_speed=50, yaw_speed=100).wait_for_completed()
             
-            # สแกนสภาพแวดล้อมรอบตัว
+            # 1. สแกนสภาพแวดล้อม
             scan_results = scan_environment()
             print(scan_results)
             
+            # try: # map
+                # 1. แปลงมุมองศาเป็นทิศทาง 0-3
+            discrete_orientation = _get_discretized_orientation(current_heading_degrees)
+                # 2. อัปเดตข้อมูลกำแพงจากผลสแกน
+            walls = update_map_and_walls(current_pos, discrete_orientation, scan_results, walls)
+                # 3. วาดแผนที่ล่าสุด
+                # plot_maze(walls, current_pos, visited_nodes, "Real-time Maze Exploration")
+                # 4. อัปเดตหน้าต่างแสดงผล
+                # plt.pause(0.01)
+            # except Exception as e:
+            #     print(f"Error plotting: {e}")
+            
+            # 2. ตัดสินใจเลือกเส้นทางด้วย DFS
             chosen = decide_by_dfs(scan_results, current_pos, current_heading_degrees)
-            # if chosen:
-            #     path_stack.append((current_pos, current_heading_degrees))
-            #     new_pos, new_heading = get_new_pos_and_heading(chosen, current_pos, current_heading_degrees)
-                # TURNING
-                # turn_to_angle(ep_chassis, ep_gimbal, new_heading)
-                # current_heading_degrees = new_heading
+            if chosen:
+                path_stack.append((current_pos, current_heading_degrees))
+                print(path_stack)
+                new_pos, new_heading = get_new_pos_and_heading(chosen, current_pos, current_heading_degrees)
+                # print(new_pos, new_heading)
+                turn_to_angle(ep_chassis, ep_gimbal, new_heading)
+                current_heading_degrees = new_heading
                 # MOVING
-                # move_straight_60cm(ep_chassis, current_heading_degrees)
-                # current_pos = new_pos
+                move_straight_60cm(ep_chassis, current_heading_degrees)
+                current_pos = new_pos
                 # visited_nodes.add(current_pos)
-        
-                    
 
-            # === State: TURNING ===       
-            # turn_to_angle(ep_chassis, ep_gimbal, target_heading_degrees)
-            # current_heading_degrees = target_heading_degrees  # อัปเดตทิศทางปัจจุบัน
-
-            # # === State: MOVING ===
-            # move_straight_60cm(ep_chassis, current_heading_degrees)
-            # print(f"ถึงโหนดใหม่ที่ {current_pos}, ทิศทาง {current_heading_degrees}°")
-               
+            # else:   # === กรณีเจอทางตัน, เริ่ม Backtrack ===
+            #     # เรียกฟังก์ชัน backtrack
+            #     backtracked = backtrack(ep_chassis, ep_gimbal)
+            #     if not backtracked:
+            #         # สำรวจเสร็จสิ้น. ไม่เหลือเส้นทางให้ย้อนกลับแล้ว
+            #         stop_flag = True
+            #         break
+            print('----------------------------')
+            time.sleep(7)  
                 
         
     stop_flag = True  # ส่งสัญญาณให้ IR thread หยุดทำงาน
@@ -492,8 +569,7 @@ if __name__ == '__main__':
     ep_sensor.unsub_distance() 
     ep_chassis.unsub_attitude()  
     ep_robot.close()
-    # plot_maze(walls, path_stack[-1], visited, "Final Exploration Map")
+    plot_maze(walls, current_pos, visited_nodes, "Final Exploration Map")
     # _fig.savefig("final_maze_map.png", dpi=300)
-    # finalize_show()
+    finalize_show()
         
-    # print("โปรแกรมปิดตัวลงเรียบร้อย")
