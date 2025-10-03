@@ -11,6 +11,7 @@ stop_flag = False
 # ตัวแปรสำหรับเก็บค่าจากเซ็นเซอร์ ToF และ IMU (อัปเดตโดย callback functions)
 tof_distance_cm = 999.0  # ระยะทางจาก ToF sensor (เริ่มต้นเป็นค่าไกลมาก)
 current_yaw = 0.0  # มุม yaw ปัจจุบันของหุ่นยนต์ (จาก IMU)
+robot_position_x = 0.0 # <--- เพิ่มตรงนี้: ตัวแปรเก็บตำแหน่งแกน X จาก Encoder
 
 # ตัวแปรสำหรับ IR Sensors จาก Sensor Adaptor
 ir_left_cm = 999.0  # ระยะทางด้านซ้าย (cm)
@@ -373,52 +374,45 @@ def turn_to_angle(ep_chassis, ep_gimbal, target_angle):
 # --- อัปเดต: ฟังก์ชันเดินตรง ให้ใช้ตัวแปร ir_left_cm, ir_right_cm ---
 def move_straight_60cm(ep_chassis, target_yaw):
     """
-    เดินหน้าตรงไป 60 cm โดยใช้ PID ควบคุม:
-      - แกน X: ระยะทาง (PID คุมให้เดิน 60 cm)
-      - แกน Z: รักษาทิศทาง (PID คุม yaw)
-      - แกน Y: หลีกเลี่ยงกำแพง (Rule-based)
-
-    Parameters:
-        ep_chassis: object ควบคุมการเคลื่อนที่
-        target_yaw: มุม yaw เป้าหมาย (degrees)
+    เดินหน้าตรงไป 60 cm โดยใช้ Encoder ควบคุมระยะทาง และ PID ควบคุมทิศทาง
     """
-    global ir_left_cm, ir_right_cm, current_yaw, stop_flag
+    global robot_position_x, ir_left_cm, ir_right_cm, current_yaw, stop_flag
 
-    # ===================== PID Parameters =====================
-    # แกน X (เดินไปข้างหน้า)
-    Kp_x, Ki_x, Kd_x = 2.0, 0.0, 0.05
-    tolerance_x = 0.01      # error ที่ยอมรับได้ (m) ≈ 2 cm
+    # ===================== PID & Control Parameters =====================
+    # แกน X (ระยะทาง) - ใช้ P-Controller ก็เพียงพอ
+    Kp_x = 2.0
+    tolerance_x = 0.02  # error ที่ยอมรับได้ (m) ≈ 2 cm
 
     # แกน Z (ทิศทาง yaw)
     Kp_z, Ki_z, Kd_z = 0.8, 0.02, 0.1
-    tolerance_z = 2.0       # error ที่ยอมรับได้ (°)
+    tolerance_z = 2.0  # error ที่ยอมรับได้ (°)
+    integral_z, last_error_z = 0.0, 0.0
 
     # Wall avoidance (แกน Y)
     avoid_speed_y = WALL_AVOID_SPEED_Y
     avoid_threshold_cm = WALL_AVOID_THRESHOLD_CM
 
     # ===================== Initial Values =====================
-    integral_x, last_error_x = 0.0, 0.0
-    integral_z, last_error_z = 0.0, 0.0
+    start_x = robot_position_x  # <--- สำคัญ: อ่านค่าตำแหน่งเริ่มต้นจาก Encoder
     traveled_distance = 0.0
-
-    start_time = time.time()
-    last_time = start_time
+    last_time = time.time()
 
     # ===================== Main Loop =====================
-    while traveled_distance < NODE_DISTANCE - tolerance_x and not stop_flag:
+    # Loop จนกว่าระยะทางที่เคลื่อนที่จาก Encoder จะถึงเป้าหมาย
+    while traveled_distance < (NODE_DISTANCE - tolerance_x) and not stop_flag:
         current_time = time.time()
         dt = current_time - last_time
         if dt <= 0:
             time.sleep(0.01)
             continue
 
-        # --- PID แกน X (คุมระยะทาง) ---
+        # --- คำนวณระยะทางที่เคลื่อนที่จริงจาก Encoder ---
+        traveled_distance = abs(robot_position_x - start_x)
+
+        # --- P-Control แกน X (คุมความเร็วตามระยะทางที่เหลือ) ---
         error_x = NODE_DISTANCE - traveled_distance
-        integral_x += error_x * dt
-        derivative_x = (error_x - last_error_x) / dt
-        x_speed = (Kp_x * error_x) + (Ki_x * integral_x) + (Kd_x * derivative_x)
-        x_speed = max(min(x_speed, MOVE_SPEED_X), -MOVE_SPEED_X)
+        x_speed = Kp_x * error_x
+        x_speed = max(min(x_speed, MOVE_SPEED_X), -MOVE_SPEED_X) # จำกัดความเร็ว
 
         # --- PID แกน Z (คุม yaw) ---
         error_z = normalize_angle(target_yaw - current_yaw)
@@ -426,7 +420,6 @@ def move_straight_60cm(ep_chassis, target_yaw):
         derivative_z = (error_z - last_error_z) / dt
         z_speed = (Kp_z * error_z) + (Ki_z * integral_z) + (Kd_z * derivative_z)
 
-        # ถ้า error_z อยู่ใน tolerance → ไม่ต้องหมุน
         if abs(error_z) < tolerance_z:
             z_speed = 0.0
 
@@ -440,16 +433,15 @@ def move_straight_60cm(ep_chassis, target_yaw):
         # --- ส่งคำสั่งเคลื่อนที่ ---
         ep_chassis.drive_speed(x=x_speed, y=y_speed, z=z_speed)
 
-        # --- Update States ---
-        traveled_distance += abs(x_speed) * dt
-        last_error_x, last_error_z = error_x, error_z
+        # --- Update States for next loop ---
+        last_error_z = error_z
         last_time = current_time
         time.sleep(0.02)
 
     # ===================== Stop Motion =====================
     ep_chassis.drive_speed(x=0, y=0, z=0)
     time.sleep(0.5)
-    print(f"เคลื่อนที่ 60 ")
+    print(f"เคลื่อนที่ 60cm สำเร็จ (Encoder: {traveled_distance:.3f} m)")
 
 
 
