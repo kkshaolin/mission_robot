@@ -27,20 +27,6 @@ ir_right_cm = 999.0
 last_value_left = 0
 last_value_right = 0
 
-# --- Maze State Variables (จัดการสถานะของ DFS) ---
-# เก็บข้อมูลแผนที่: key=ตำแหน่ง(x,y), value=set ของทิศทางที่เปิด (degrees)
-maze_map = {}
-# เก็บตำแหน่งทั้งหมดที่เคยไปแล้ว
-visited_nodes = set()
-# stack สำหรับเก็บเส้นทางการเดินตาม DFS
-path_stack = []
-# เก็บพิกัดของกำแพงทั้งหมด (tuple ของคู่ตำแหน่ง)
-walls = set()
-# ตำแหน่งปัจจุบันของหุ่นยนต์ในเขาวงกต (x, y)
-current_pos = (1, 1) # ตำแหน่งเริ่มต้น (x, y)
-# ทิศทางหัวหุ่นยนต์ปัจจุบัน: 0=เหนือ, 90=ตะวันออก, -90=ตะวันตก, 180=ใต้
-current_heading_degrees = 0 # ทิศทางเริ่มต้น 0=N, 90=E, -90=W, 180=S
-
 # --- ค่าคงที่สำหรับเขาวงกตและการเคลื่อนที่ ---
 # ระยะเวลาในการสแกนสภาพแวดล้อม (วินาที)
 SCAN_DURATION_S = 0.2
@@ -53,17 +39,35 @@ START_CELL = (1, 1)
 # ขอบเขตขั้นต่ำของแผนที่ (x_min, y_min)
 MAP_MIN_BOUNDS = (1, 1)
 # ขอบเขตสูงสุดของแผนที่ (x_max, y_max)
-MAP_MAX_BOUNDS = (3, 3)
+MAP_MAX_BOUNDS = (4, 4)
 # ระยะทางระหว่างช่องในเขาวงกต (เมตร)
 NODE_DISTANCE = 0.6
 # ระยะที่เริ่มหลีกเลี่ยงกำแพงด้านข้าง (cm)
 WALL_AVOID_THRESHOLD_CM = 10.0
 # ความเร็วในการขยับหลีกเลี่ยงกำแพง (m/s)
 WALL_AVOID_SPEED_Y = 0.05
-# ความเร็วการเดินหน้าสูงสุด (m/s)
-MOVE_SPEED_X = 2
 # ความเร็วการหมุนสูงสุด (degrees/s)
 TURN_SPEED_Z = 60
+
+# --- Maze State Variables (จัดการสถานะของ DFS) ---
+# เก็บข้อมูลแผนที่: key=ตำแหน่ง(x,y), value=set ของทิศทางที่เปิด (degrees)
+maze_map = {}
+# เก็บตำแหน่งทั้งหมดที่เคยไปแล้ว
+visited_nodes = set()
+# stack สำหรับเก็บเส้นทางการเดินตาม DFS
+path_stack = []
+# เก็บพิกัดของกำแพงทั้งหมด (tuple ของคู่ตำแหน่ง)
+walls = set()
+# ตำแหน่งปัจจุบันของหุ่นยนต์ในเขาวงกต (x, y)
+current_pos = START_CELL # ตำแหน่งเริ่มต้น (x, y)
+# ทิศทางหัวหุ่นยนต์ปัจจุบัน: 0=เหนือ, 90=ตะวันออก, -90=ตะวันตก, 180=ใต้
+current_heading_degrees = 0 # ทิศทางเริ่มต้น 0=N, 90=E, -90=W, 180=S
+
+#----A Star---------
+# Target marks (เช็กพอยท์) — ใส่พิกัด (cell grid) ที่คุณจะเพิ่มในอนาคตที่นี่
+target_marks = []  # <-- แก้ตรงนี้ตามที่ต้องการ (list of (x,y) tuples)
+# ติดตามเส้นทางจริงที่หุ่นยนต์เดิน (เพื่อบันทึก)
+traveled_path = []
 
 # --- PID Controller Gains ---
 # ค่า Proportional gain สำหรับการหมุน
@@ -283,89 +287,92 @@ def move_straight_60cm(ep_chassis, target_yaw):
         ep_chassis: object ควบคุมการเคลื่อนที่
         target_yaw: มุมทิศทางที่ต้องการรักษา (degrees)
     """
-    global ir_left_cm, ir_right_cm, current_yaw, current_x, current_y
-    
-    # บันทึกตำแหน่งเริ่มต้น
-    start_x = current_x
-    start_y = current_y
-    
-    # ค่า PID gains สำหรับแกน X (ระยะทาง)
-    Kp_x, Ki_x, Kd_x = 3.0, 0.0, 0.05
-    # ค่า PID gains สำหรับแกน Z (ทิศทาง)
-    Kp_z, Ki_z, Kd_z = 0.8, 0.02, 0.1
-    # เริ่มต้นตัวแปร PID สำหรับแกน X
-    integral_x, last_error_x = 0.0, 0.0
-    # เริ่มต้นตัวแปร PID สำหรับแกน Z
-    integral_z, last_error_z = 0.0, 0.0
-    
-    # บันทึกเวลาเริ่มต้น
-    last_time = time.time()
+    global ir_left_cm, ir_right_cm, current_yaw, current_x, current_y, tof_distance_cm, stop_flag
 
-    print(f"กำลังเคลื่อนที่ไปข้างหน้า {NODE_DISTANCE} m")
-    
-    # วนลูปจนกว่าจะเดินครบระยะทาง
+    # ---------- CONFIG ----------
+    target_distance_m = 0.6  # 60 cm
+    tol_m = 0.01             # 1 cm tolerance
+    FRONT_SAFETY_CM = 12.0   # หยุดเมื่อเจอสิ่งกีดขวางใกล้หน้า
+
+    # ---------- PID GAIN ----------
+    # แกน X (ระยะทาง)
+    Kp_x, Ki_x, Kd_x = 3.0, 0.0, 0.1
+    # แกน Z (ทิศทาง)
+    Kp_z, Ki_z, Kd_z = 0.8, 0.02, 0.1
+    max_forward_speed = 2.0  # m/s
+
+    # ---------- PID STATE ----------
+    integral_x, last_error_x = 0.0, 0.0
+    integral_z, last_error_z = 0.0, 0.0
+
+    # ---------- เริ่มต้น ----------
+    start_x, start_y = current_x, current_y
+    last_time = time.time()
+    print(f"กำลังเคลื่อนที่ไปข้างหน้า {target_distance_m} m (target_yaw={target_yaw}°)")
+
+    # ---------- MAIN LOOP ----------
     while not stop_flag:
-        # บันทึกเวลาปัจจุบัน
         current_time = time.time()
-        # คำนวณ delta time
         dt = current_time - last_time
-        # ถ้า dt ไม่ถูกต้อง ข้ามรอบนี้
         if dt <= 0:
             time.sleep(0.01)
             continue
-        
-        # คำนวณระยะทางที่เดินมาแล้วจากตำแหน่งเริ่มต้น
-        traveled_distance = math.sqrt((current_x - start_x)**2 + (current_y - start_y)**2)
-        
-        # ตรวจสอบว่าถึงเป้าหมายแล้วหรือยัง (ใช้ tolerance 1 cm)
-        if traveled_distance >= NODE_DISTANCE - 0.01:
+
+        # === ระยะที่เดินแล้ว ===
+        dx = current_x - start_x
+        dy = current_y - start_y
+        traveled = math.hypot(dx, dy)
+        remaining = target_distance_m - traveled
+        err = remaining
+
+        # ถึงเป้าหมาย
+        if abs(err) <= tol_m:
+            print(f"ถึงเป้าหมาย: เดินแล้ว {traveled:.3f} m (target 0.6 m)")
             break
-        
-        # --- PID แกน X (คุมระยะทาง) ---
-        # error = ระยะทางที่เหลือ
-        error_x = NODE_DISTANCE - traveled_distance
-        # คำนวณ Integral term
+
+        # เจอสิ่งกีดขวางข้างหน้า
+        if tof_distance_cm <= FRONT_SAFETY_CM:
+            print(f"หยุดฉุกเฉิน! พบสิ่งกีดขวางหน้า ToF={tof_distance_cm:.1f} cm")
+            break
+
+        # ---------- PID ระยะทาง (X) ----------
+        error_x = target_distance_m - traveled
         integral_x += error_x * dt
-        # คำนวณ Derivative term
         derivative_x = (error_x - last_error_x) / dt
-        # คำนวณความเร็ว X จากสูตร PID และจำกัดไม่ให้เกินค่าสูงสุด
-        x_speed = max(min((Kp_x * error_x) + (Ki_x * integral_x) + (Kd_x * derivative_x), MOVE_SPEED_X), -MOVE_SPEED_X)
-        
-        # --- PID แกน Z (คุมทิศทาง) ---
-        # error = มุมที่เบี่ยงเบนจากเป้าหมาย
+        forward_speed = (Kp_x * error_x) + (Ki_x * integral_x) + (Kd_x * derivative_x)
+        x_speed = max(0.0, min(forward_speed, max_forward_speed))
+
+        # ---------- PID หมุน (Z) ----------
+        print(target_yaw ,'-', current_yaw)
         error_z = normalize_angle(target_yaw - current_yaw)
-        # คำนวณ Integral term
         integral_z += error_z * dt
-        # คำนวณ Derivative term
         derivative_z = (error_z - last_error_z) / dt
-        # คำนวณความเร็วการหมุนจากสูตร PID
         z_speed = (Kp_z * error_z) + (Ki_z * integral_z) + (Kd_z * derivative_z)
-        # ถ้า error น้อยกว่า 2 องศา ไม่ต้องหมุน
-        if abs(error_z) < 2.0: z_speed = 0.0
-        
-        # --- Wall Avoidance (แกน Y) ---
-        # เริ่มต้นความเร็วแกน Y เป็น 0
+        if abs(error_z) < 2.0:
+            z_speed = 0.0
+
+        # ---------- หลีกกำแพงด้านข้าง (Y) ----------
         y_speed = 0.0
-        # ถ้ากำแพงขวาใกล้เกินไป ขยับไปซ้าย
-        if ir_right_cm < WALL_AVOID_THRESHOLD_CM: y_speed -= WALL_AVOID_SPEED_Y
-        # ถ้ากำแพงซ้ายใกล้เกินไป ขยับไปขวา
-        if ir_left_cm < WALL_AVOID_THRESHOLD_CM: y_speed += WALL_AVOID_SPEED_Y
-        
-        # สั่งให้หุ่นยนต์เคลื่อนที่ตามความเร็วที่คำนวณ
-        ep_chassis.drive_speed(x=x_speed, y=y_speed, z=z_speed)
-        
-        # บันทึก error สำหรับรอบถัดไป
+        if ir_right_cm < WALL_AVOID_THRESHOLD_CM:
+            y_speed -= WALL_AVOID_SPEED_Y
+        if ir_left_cm < WALL_AVOID_THRESHOLD_CM:
+            y_speed += WALL_AVOID_SPEED_Y
+
+        # ---------- ส่งคำสั่งเคลื่อนที่ ----------
+        ep_chassis.drive_speed(x=x_speed, y=y_speed, z=0)
+
+        # อัปเดตค่า PID
         last_error_x, last_error_z = error_x, error_z
-        # อัปเดตเวลา
         last_time = current_time
-        # รอ 20ms
+
+        # loop ความถี่ 50Hz
         time.sleep(0.02)
-    
-    # หยุดการเคลื่อนที่
+
+    # ---------- หยุด ----------
     ep_chassis.drive_speed(x=0, y=0, z=0)
-    # รอให้หุ่นยนต์หยุดนิ่ง
     time.sleep(0.5)
-    print(f"เคลื่อนที่สำเร็จ: ระยะทาง {traveled_distance:.3f} m")
+    print("เคลื่อนที่สำเร็จ: ระยะทาง 60 cm")
+
 
 # ===================== DFS Logic Functions =====================
 def scan_environment():
@@ -607,7 +614,8 @@ if __name__ == '__main__':
     
     # --- Main Exploration Loop ---
     # วนลูปจนกว่า path_stack จะว่าง (สำรวจเสร็จแล้ว) หรือมีคำสั่งหยุด
-    while path_stack and not stop_flag:
+    # while path_stack and not stop_flag:
+    for i in range(1):
         # ตรวจสอบว่ามีการกดปุ่ม ESC หรือไม่
         if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
             print("กดปุ่ม ESC กำลังหยุดการทำงาน...")
@@ -626,7 +634,7 @@ if __name__ == '__main__':
         # พยายามหาและเคลื่อนที่ไปยังช่องถัดไป
         if find_and_move_to_next_cell(ep_chassis, ep_gimbal):
             # ถ้าเคลื่อนที่สำเร็จ วนลูปต่อ
-            continue
+            continue    # ถ้า True จะข้าม backtrack
         
         # ถ้าไม่มีทางไปต่อ ทำการ backtrack
         if not backtrack(ep_chassis, ep_gimbal):
