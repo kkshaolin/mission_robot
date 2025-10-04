@@ -4,6 +4,7 @@ import time  # สำหรับจัดการเวลาและ delay
 import math  # สำหรับคำนวณมุมและตำแหน่ง (atan2, degrees)
 import threading  # สำหรับรันการอ่านค่า IR แบบ concurrent (พร้อมกัน)
 import matplotlib.pyplot as plt  # สำหรับวาดกราฟแผนที่เขาวงกต
+plt.switch_backend('Agg') # <<< เพิ่มบรรทัดนี้: เพื่อไม่ให้แสดงหน้าต่างกราฟ
 import numpy as np  # สำหรับจัดการอาร์เรย์และช่วงตัวเลข
 
 # ===================== Global State & Constants =====================
@@ -614,7 +615,7 @@ if __name__ == '__main__':
             break
 
         # วาดแผนที่ปัจจุบัน
-        plot_maze(walls, visited_nodes, path_stack, current_pos)
+        # plot_maze(walls, visited_nodes, path_stack, current_pos)
         # แสดงสถานะปัจจุบัน
         print(f"\nตำแหน่ง: {current_pos}, ทิศทาง: {current_heading_degrees}°")
 
@@ -633,25 +634,33 @@ if __name__ == '__main__':
             # ถ้า backtrack ไม่ได้ (กลับถึงจุดเริ่มต้นแล้ว) ออกจากลูป
             break
 
-    # แสดงข้อความเสร็จสิ้น
+# --- สิ้นสุดการทำงานและบันทึกแผนที่ ---
     print("\nการสำรวจ DFS เสร็จสมบูรณ์")
-    # วาดแผนที่สุดท้าย
-    plot_maze(walls, visited_nodes, path_stack, current_pos, "Final Map")
+ 
+    # 1. วาดแผนที่สุดท้ายลงบน canvas (ที่ซ่อนอยู่)
+    print("กำลังสร้างแผนที่สุดท้าย...")
+    plot_maze(walls, visited_nodes, path_stack, current_pos, "Final Maze Map")
 
+    # 2. บันทึกแผนที่ที่วาดไว้เป็นไฟล์ PNG
+    try:
+        file_name = 'final_maze_map.png'
+        # บันทึกไฟล์ด้วยความละเอียด 300 DPI เพื่อให้ภาพคมชัด
+        plt.savefig(file_name, dpi=300, bbox_inches='tight')
+        print(f"บันทึกแผนที่ '{file_name}' เรียบร้อยแล้ว")
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการบันทึกไฟล์: {e}")
+
+    # 3. ทำความสะอาดและปิดการเชื่อมต่อ
     print("กำลังทำความสะอาดและปิดการเชื่อมต่อ...")
-    # ตั้งค่า flag เพื่อหยุด thread อ่าน IR
     stop_flag = True
-    # รอให้ thread ปิด
-    time.sleep(0.2)
-    # หยุดการเคลื่อนที่
+    time.sleep(0.2) # รอให้ thread ปิด
     ep_chassis.drive_speed(x=0, y=0, z=0)
-    # ยกเลิก subscription เซ็นเซอร์ ToF
-    ep_sensor.unsub_distance()
-    # ยกเลิก subscription attitude (IMU)
-    ep_chassis.unsub_attitude()
 
+    # Unsubscribe ทุกอย่าง
+    ep_sensor.unsub_distance()
+    ep_chassis.unsub_attitude()
     ep_chassis.unsub_position()
+    
     # ปิดการเชื่อมต่อกับหุ่นยนต์
     ep_robot.close()
-    # แสดงกราฟสุดท้ายและรอให้ผู้ใช้ปิด
-    finalize_show()
+    print("โปรแกรมจบการทำงาน")
