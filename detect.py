@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+# ... (ส่วนค่าคงที่ต่างๆ เหมือนเดิม ไม่มีการเปลี่ยนแปลง) ...
 WIDTH = 848
 HEIGHT = 480
 RESOLUTION = '480p'
@@ -53,6 +54,7 @@ INT_CLAMP = 30000.0
 # UTILITY FUNCTIONS
 # ============================================================================
 
+# ... (ฟังก์ชัน Utility ทั้งหมดเหมือนเดิม) ...
 def clamp(x, lo, hi):
     """Clamp value between lo and hi"""
     return lo if x < lo else hi if x > hi else x
@@ -124,39 +126,62 @@ def pid_reset(state):
     state['prev_t'] = None
     state['d_ema'] = 0.0
 
+
 # ============================================================================
-# COLOR DETECTION FUNCTIONS
+# COLOR & SHAPE DETECTION FUNCTIONS  # <<< MODIFIED SECTION NAME
 # ============================================================================
 
-def detect_color(frame, color_name):
+# <<< NEW: Function to identify shapes based on contour geometry
+def identify_shape(contour):
     """
-    Detect specific color in frame
-    
-    Args:
-        frame: BGR image
-        color_name: 'red', 'green', 'blue', or 'yellow'
-    
+    Identify shape from a contour.
+
     Returns:
-        Binary mask (numpy array)
+        'circle', 'square', 'horizontal_rectangle', 
+        'vertical_rectangle', or 'unknown'
     """
-    # Apply ROI mask
+    shape = 'unknown'
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.03 * peri, True)
+    area = cv2.contourArea(contour)
+
+    # Check for Quadrilaterals (4 vertices)
+    if len(approx) == 4:
+        (x, y, w, h) = cv2.boundingRect(approx)
+        aspect_ratio = float(w) / h if h > 0 else 0
+        
+        if 0.95 <= aspect_ratio <= 1.05:
+            shape = 'square'
+        elif aspect_ratio > 1.05:
+            shape = 'horizontal_rectangle'
+        else:
+            shape = 'vertical_rectangle'
+    
+    # Check for Circle (using circularity)
+    else:
+        if peri > 0:
+            circularity = 4 * np.pi * (area / (peri * peri))
+            if circularity > 0.85: # Threshold for circle-likeness
+                shape = 'circle'
+                
+    return shape
+
+def detect_color(frame, color_name):
+    # ... (This function remains unchanged) ...
     m = frame.copy()
     m[0:MASK_TOP_Y, :] = 0
     m[MASK_BOTTOM_Y:, :] = 0
     m[:, 0:MASK_LEFT_X] = 0
     m[:, MASK_RIGHT_X:] = 0
     
-    # Preprocess
     blur = cv2.GaussianBlur(m, (7,7), 1)
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     
-    # Create color mask
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for color_range in COLOR_RANGES[color_name]:
         temp_mask = cv2.inRange(hsv, color_range['lower'], color_range['upper'])
         mask = cv2.bitwise_or(mask, temp_mask)
     
-    # Morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=MORPH_OPEN_ITER)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_CLOSE_ITER)
@@ -164,15 +189,13 @@ def detect_color(frame, color_name):
     
     return mask
 
+# <<< MODIFIED: This function now also identifies and returns the shape
 def find_largest_target(mask):
     """
-    Find largest valid contour in mask
-    
-    Args:
-        mask: Binary mask
+    Find largest valid contour in mask and identify its shape.
     
     Returns:
-        Target dict with keys: 'bbox', 'center', 'area', 'contour'
+        Target dict with keys: 'bbox', 'center', 'area', 'contour', 'shape'
         or None if no valid target found
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -184,7 +207,7 @@ def find_largest_target(mask):
         area = cv2.contourArea(cnt)
         
         # Filter by area
-        if area < MIN_CONTOUR_AREA or area > MAX_CONTOUR_AREA:
+        if not (MIN_CONTOUR_AREA <= area <= MAX_CONTOUR_AREA):
             continue
         
         x, y, w, h = cv2.boundingRect(cnt)
@@ -192,12 +215,10 @@ def find_largest_target(mask):
         center_y = y + h/2
         
         # Filter by ROI bounds
-        if not (MASK_TOP_Y < center_y < MASK_BOTTOM_Y):
-            continue
-        if not (MASK_LEFT_X < center_x < MASK_RIGHT_X):
+        if not (MASK_TOP_Y < center_y < MASK_BOTTOM_Y and MASK_LEFT_X < center_x < MASK_RIGHT_X):
             continue
         
-        # Filter by aspect ratio
+        # Filter by aspect ratio (basic check)
         aspect = float(w)/h if h > 0 else 0
         if not (MIN_ASPECT_RATIO <= aspect <= MAX_ASPECT_RATIO):
             continue
@@ -209,33 +230,35 @@ def find_largest_target(mask):
         if solidity < MIN_SOLIDITY:
             continue
         
-        valid.append((cnt, area))
+        # <<< NEW: Identify the shape of the contour
+        shape = identify_shape(cnt)
+        if shape == 'unknown':
+            continue
+
+        # <<< MODIFIED: Add shape to the list of valid contours
+        valid.append((cnt, area, shape))
     
     if not valid:
         return None
     
     # Return largest valid contour
-    largest_cnt, _ = max(valid, key=lambda x: x[1])
+    # <<< MODIFIED: Unpack shape from the winning contour
+    largest_cnt, area, shape = max(valid, key=lambda x: x[1])
     hull = cv2.convexHull(largest_cnt)
     x, y, w, h = cv2.boundingRect(hull)
     
+    # <<< MODIFIED: Include shape in the returned dictionary
     return {
         'bbox': (x, y, x+w, y+h),
         'center': (x+w/2, y+h/2),
-        'area': cv2.contourArea(largest_cnt),
-        'contour': largest_cnt
+        'area': area,
+        'contour': largest_cnt,
+        'shape': shape
     }
 
 def detect_all_colors(frame, target_colors=['red', 'green', 'blue', 'yellow']):
     """
-    Detect all target colors in frame
-    
-    Args:
-        frame: BGR image
-        target_colors: List of color names to detect
-    
-    Returns:
-        Dict mapping color name to target info
+    Detect all target colors and shapes in frame.
     """
     all_targets = {}
     
@@ -244,35 +267,25 @@ def detect_all_colors(frame, target_colors=['red', 'green', 'blue', 'yellow']):
         target = find_largest_target(mask)
         if target:
             target['color'] = color
-            all_targets[color] = target
+            # Use a unique key combining color and shape
+            all_targets[f"{color}_{target['shape']}"] = target
     
     return all_targets
 
+# <<< MODIFIED: Priority selection now looks inside the dictionary values
 def select_target_by_priority(all_targets, priority=['red', 'green', 'blue', 'yellow']):
     """
-    Select target based on priority order
-    
-    Args:
-        all_targets: Dict of detected targets
-        priority: List of colors in priority order
-    
-    Returns:
-        Selected target dict or None
+    Select target based on color priority order.
     """
     for color in priority:
-        if color in all_targets:
-            return all_targets[color]
+        for target in all_targets.values():
+            if target['color'] == color:
+                return target
     return None
 
 def select_largest_target(all_targets):
     """
-    Select largest target by area
-    
-    Args:
-        all_targets: Dict of detected targets
-    
-    Returns:
-        Largest target dict or None
+    Select largest target by area.
     """
     if not all_targets:
         return None
@@ -282,15 +295,10 @@ def select_largest_target(all_targets):
 # TRACKING FUNCTIONS
 # ============================================================================
 
+# ... (Tracking functions remain unchanged) ...
 def track_target(gimbal, target, tracker_state, t_now):
     """
     Track target with gimbal using PID control
-    
-    Args:
-        gimbal: Robomaster gimbal object
-        target: Target dict with 'center' key, or None
-        tracker_state: Dict with 'kalman', 'pid_yaw', 'pid_pitch' states
-        t_now: Current timestamp
     """
     if target:
         cx, cy = target['center']
@@ -312,10 +320,6 @@ def track_target(gimbal, target, tracker_state, t_now):
 def stop_tracking(gimbal, tracker_state):
     """
     Stop gimbal and reset tracking state
-    
-    Args:
-        gimbal: Robomaster gimbal object
-        tracker_state: Dict with 'kalman', 'pid_yaw', 'pid_pitch' states
     """
     gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
     pid_reset(tracker_state['pid_yaw'])
@@ -325,9 +329,6 @@ def stop_tracking(gimbal, tracker_state):
 def create_tracker_state():
     """
     Create new tracker state
-    
-    Returns:
-        Dict with kalman and PID states
     """
     return {
         'kalman': create_kalman_state(),
@@ -335,52 +336,51 @@ def create_tracker_state():
         'pid_pitch': create_pid_state()
     }
 
+
 # ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
+# <<< MODIFIED: This function now also draws the shape name
 def draw_targets(frame, selected, all_targets, show_crosshair=True):
     """
-    Draw detection visualization on frame
-    
-    Args:
-        frame: BGR image (modified in-place)
-        selected: Selected target dict or None
-        all_targets: Dict of all detected targets
-        show_crosshair: Whether to draw center crosshair
+    Draw detection visualization on frame, including shape names.
     """
     h, w = frame.shape[:2]
     
-    # Draw center crosshair
     if show_crosshair:
         cv2.drawMarker(frame, (int(w/2), int(h/2)), (255,255,255), cv2.MARKER_CROSS, 20, 2)
     
     color_map = {
-        'red': (0, 0, 255),
-        'green': (0, 255, 0),
-        'blue': (255, 0, 0),
-        'yellow': (0, 255, 255)
+        'red': (0, 0, 255), 'green': (0, 255, 0),
+        'blue': (255, 0, 0), 'yellow': (0, 255, 255)
     }
     
     # Draw non-selected targets
-    for color, target in all_targets.items():
+    for target in all_targets.values():
         if target == selected:
             continue
         x1, y1, x2, y2 = map(int, target['bbox'])
+        color = target['color']
+        shape = target['shape']
+        label = f"{color.upper()} {shape.replace('_', ' ').upper()}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), color_map[color], 1)
-        cv2.putText(frame, color.upper(), (x1, y1-5),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_map[color], 1)
+        cv2.putText(frame, label, (x1, y1-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_map[color], 1)
     
     # Draw selected target
     if selected:
         x1, y1, x2, y2 = map(int, selected['bbox'])
         color = selected['color']
+        shape = selected['shape']
+        label = f"{color.upper()} {shape.replace('_', ' ').upper()}"
+        
         cv2.rectangle(frame, (x1, y1), (x2, y2), color_map[color], 3)
         cx, cy = map(int, selected['center'])
         cv2.circle(frame, (cx, cy), 6, color_map[color], -1)
         cv2.drawMarker(frame, (cx, cy), (255,255,255), cv2.MARKER_CROSS, 10, 1)
-        cv2.putText(frame, color.upper(), (x1, y1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_map[color], 2)
+        cv2.putText(frame, label, (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_map[color], 2)
 
 # ============================================================================
 # EXAMPLE USAGE
@@ -409,32 +409,29 @@ def run_detection_test():
             if frame is None:
                 continue
             
-            # Detect all colors
             all_targets = detect_all_colors(frame)
-            
-            # Select target by priority
             selected = select_target_by_priority(all_targets, priority)
-            
-            # Track target
             track_target(gim, selected, tracker_state, t_now)
             
-            # Visualization
             dbg = frame.copy()
             draw_targets(dbg, selected, all_targets)
             
             y = 30
             if selected:
-                cv2.putText(dbg, f"Target: {selected['color'].upper()}", (10, y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                # <<< MODIFIED: Display both color and shape of the target
+                color = selected['color'].upper()
+                shape = selected['shape'].replace('_', ' ').upper()
+                cv2.putText(dbg, f"Target: {color} {shape}", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 cv2.putText(dbg, "No target", (10, y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             y += 30
             cv2.putText(dbg, f"Found: {len(all_targets)}", (10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            cv2.imshow("Multi-Color Detection", dbg)
+            cv2.imshow("Multi-Color & Shape Detection", dbg)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
