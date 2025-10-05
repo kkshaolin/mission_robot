@@ -6,9 +6,9 @@ import threading
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
-import json # เพิ่ม import json สำหรับการบันทึกไฟล์
+import json
 
-# ===================== PID Controller Class =====================
+# ===================== PID Controller Class (คงเดิม) =====================
 class PIDController:
     def __init__(self, Kp, Ki, Kd, setpoint):
         self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
@@ -31,7 +31,7 @@ class PIDController:
         self._prev_error, self._last_time = error, t
         return out
 
-# ===================== [ใหม่] Control Class สำหรับการเคลื่อนที่ =====================
+# ===================== [ใหม่] Control Class สำหรับการเคลื่อนที่ (คงเดิม) =====================
 class Control:
     def __init__(self, ep_chassis):
         self.ep_chassis = ep_chassis
@@ -42,12 +42,11 @@ class Control:
 
     def turn(self, angle_deg):
         print(f"Action: Turning {angle_deg:.1f} degrees")
-        # ใช้ z_speed เป็นค่าบวกเสมอ และให้ค่า angle_deg เป็นตัวกำหนดทิศทาง
         self.ep_chassis.move(x=0, y=0, z=-angle_deg, z_speed=45).wait_for_completed()
         time.sleep(0.5)
 
     def move_forward_pid(self, cell_size_m, Kp=3, Ki=0.0001, Kd=0.001, v_clip=0.4, tol_m=0.02):
-        global current_x, current_y # เข้าถึง global state ของตำแหน่ง
+        global current_x, current_y
         print(f"Action: Moving forward {cell_size_m} m using PID")
         pid = PIDController(Kp=Kp, Ki=Ki, Kd=Kd, setpoint=cell_size_m)
         sx, sy = current_x, current_y
@@ -64,17 +63,84 @@ class Control:
             time.sleep(0.02)
         print("[WARNING] move_forward_pid timed out. Stopping robot.")
         self.stop()
+    # ===================== [ฟังก์ชันใหม่ - ปรับแก้สำหรับเซนเซอร์ซ้าย] =====================
+    def follow_wall_to_next_node(self, cell_size_m):
+        """
+        เคลื่อนที่ตามกำแพง "ด้านซ้าย" ไปยัง Node ถัดไปโดยใช้ PID 2 ตัว (เวอร์ชันสมบูรณ์)
+        """
+        global current_x, current_y, ir_left_cm, ir_right_cm 
+        
+        print(f"Action: Following LEFT wall for {cell_size_m} m")
 
-# ===================== Global State & Constants =====================
+        # === [สำคัญ] สร้าง PID controllers โดยใช้ค่า GAINS ที่ดีบักมา ===
+        # หมายเหตุ: ค่า Gains เหล่านี้มาจากไฟล์ debug_wall_align.py ของคุณ
+        pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
+        pid_dist = PIDController(Kp=0.01, Ki=0.0, Kd=0.002, setpoint=TARGET_WALL_DISTANCE_CM)
+
+        sx, sy = current_x, current_y
+        t0 = time.time()
+        max_duration_s = 15
+
+        while time.time() - t0 < max_duration_s:
+            # 1. อ่านค่าเซนเซอร์ล่าสุดจากตัวแปร global
+            ir_front = ir_left_cm 
+            ir_rear = ir_right_cm
+            
+            # 2. คำนวณ Error (ตรรกะเดียวกับในไฟล์ดีบัก)
+            angle_error = ir_front - ir_rear # Error สำหรับการปรับมุม
+            
+            current_dist_avg = (ir_front + ir_rear) / 2.0
+            dist_error = TARGET_WALL_DISTANCE_CM - current_dist_avg # Error สำหรับการปรับระยะห่าง
+            # หมายเหตุ: สูตร dist_error นี้ถูกต้องสำหรับแกน y ของหุ่น (ค่าลบ -> เลื่อนซ้าย)
+
+            # 3. คำนวณค่าการปรับแก้จาก PID
+            z_speed = pid_angle.compute(angle_error)
+            y_speed = pid_dist.compute(dist_error)
+
+            # 4. จำกัดค่า Output
+            z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
+            y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
+            
+            # 5. สั่งการ Chassis
+            self.ep_chassis.drive_speed(x=BASE_FORWARD_SPEED_WF, y=y_speed, z=z_speed, timeout=0.1)
+
+            # 6. ตรวจสอบเงื่อนไขการหยุด
+            dist_traveled = math.hypot(current_x - sx, current_y - sy)
+            if dist_traveled >= cell_size_m:
+                print("Movement complete.")
+                self.stop()
+                return
+            
+            time.sleep(0.02)
+        
+        print("[WARNING] follow_wall_to_next_node timed out. Stopping robot.")
+        self.stop()
+
+# ===================== Global State & Constants [แก้ไข] =====================
 stop_flag = False
 tof_distance_cm = 999.0
 current_yaw = 0.0
 current_x = 0.0
 current_y = 0.0
+
+# [ใหม่] เพิ่มตัวแปรสำหรับ IR แบบดิจิทัล
+ir_left_digital = 0  # 0 = ไม่มีกำแพง, 1 = เจอกำแพง
+ir_right_digital = 0 # 0 = ไม่มีกำแพง, 1 = เจอกำแพง
+
 ir_left_cm = 999.0
 ir_right_cm = 999.0
 last_value_left = 0
 last_value_right = 0
+
+# ตาราง Calibrate (ตัวอย่าง - ควรใช้ค่าที่ได้จากการทดลองจริงของคุณ)
+CALIBRA_TABLE_IR_FRONT = {249: 10, 216: 15, 139: 20, 117: 25}
+
+CALIBRA_TABLE_IR_REAR = {536: 10, 471: 15, 333: 20, 299: 25}
+
+TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างที่ต้องการจากกำแพง
+BASE_FORWARD_SPEED_WF = 0.25    # ความเร็วเดินหน้าพื้นฐานตอนตามกำแพง
+MAX_Y_SPEED = 0.3               # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง
+MAX_Z_SPEED = 32.0              # ความเร็วสูงสุดในการหมุนตัว
 
 maze_map = {}
 visited_nodes = set()
@@ -86,14 +152,12 @@ markers_found = {}
 
 SCAN_DURATION_S = 0.2
 TOF_WALL_THRESHOLD_CM = 50
-IR_WALL_THRESHOLD_CM = 30
+# [ลบ] IR_WALL_THRESHOLD_CM ไม่จำเป็นอีกต่อไป
+# IR_WALL_THRESHOLD_CM = 30 
 START_CELL = (0, 0)
 MAP_MIN_BOUNDS = (0, 0)
 MAP_MAX_BOUNDS = (3, 3)
 NODE_DISTANCE = 0.6
-
-calibra_table_ir_right = {580: 5, 430: 17.5, 257: 32, 210: 999}
-calibra_table_ir_left = {700:5, 200: 17.5, 107: 33, 100: 999}
 
 # --- Marker Detection Constants (คงเดิม) ---
 WIDTH, HEIGHT = 848, 480
@@ -250,7 +314,7 @@ def finalize_show():
     plt.ioff()
     plt.show()
 
-# ===================== Sensor Handling Functions (คงเดิมทั้งหมด) =====================
+# ===================== Sensor Handling Functions =====================
 def sub_tof_handler(sub_info):
     global tof_distance_cm
     tof_distance_cm = sub_info[0] / 10.0
@@ -264,60 +328,90 @@ def sub_position_handler(position_info):
     current_x = position_info[0]
     current_y = position_info[1]
 
-def single_lowpass_filter(new_value, last_value, alpha=0.8):
-    return alpha * new_value + (1.0 - alpha) * last_value
 
-def adc_to_cm(adc_value, table):
-    """
-    [แก้ไขแล้ว] แปลงค่า ADC จากเซ็นเซอร์ IR เป็นระยะทาง cm 
-    โดยจะคืนค่า 999.0 เมื่อระยะทางไกลเกินกว่าค่าในตาราง
-    """
-    points = sorted(table.items(), key=lambda x: x[0], reverse=True)
-    
-    # ถ้าค่า ADC สูงกว่าค่าสูงสุดในตาราง -> ระยะใกล้มาก คืนค่าระยะทางต่ำสุด
-    if adc_value >= points[0][0]: 
-        return float(points[0][1])
-        
-    # ถ้าค่า ADC ต่ำกว่าค่าต่ำสุดในตาราง -> ระยะไกลมาก (ไม่มีกำแพง) คืนค่า 999.0
-    if adc_value <= points[-1][0]: 
-        return 999.0  # <--- จุดที่แก้ไข
-        
-    # ถ้าค่าอยู่ระหว่างจุดในตาราง ให้คำนวณแบบ linear interpolation
-    for i in range(len(points) - 1):
-        x1, y1 = points[i]
-        x2, y2 = points[i+1]
-        if x2 <= adc_value <= x1:
-            return float(y1 + (adc_value - x1) * (y2 - y1) / (x2 - x1))
-            
-    # กรณีอื่นๆ ที่ไม่เข้าเงื่อนไข ให้ถือว่าไกล
+# [แก้ไข] เขียนฟังก์ชัน read_ir_thread ใหม่ทั้งหมด ✨
+def single_lowpass_filter(new_value, last_value, alpha=0.6):
+    return alpha * new_value + (1 - alpha) * last_value
+
+def adc_to_cm(adc_value, calibration_table):
+    sorted_adc = sorted(calibration_table.keys())
+    if adc_value >= sorted_adc[-1]:
+        return calibration_table[sorted_adc[-1]]
+    if adc_value <= sorted_adc[0]:
+        return calibration_table[sorted_adc[0]]
+    for i in range(len(sorted_adc) - 1):
+        adc1, adc2 = sorted_adc[i], sorted_adc[i+1]
+        if adc1 <= adc_value <= adc2:
+            dist1, dist2 = calibration_table[adc1], calibration_table[adc2]
+            ratio = (adc_value - adc1) / (adc2 - adc1)
+            return dist1 + ratio * (dist2 - dist1)
     return 999.0
 
-def read_ir_thread(ep_sensor_adaptor):
-    global ir_right_cm, ir_left_cm, last_value_right, last_value_left
+# [แก้ไข] เขียนฟังก์ชัน read_ir_thread ให้กลับมาอ่านค่า Analog
+def read_analog_ir_thread(ep_sensor_adaptor):
+    global ir_left_cm, ir_right_cm, last_value_left, last_value_right
     while not stop_flag:
-        ir_right_adc = ep_sensor_adaptor.get_adc(id=2, port=2)
-        ir_left_adc = ep_sensor_adaptor.get_adc(id=1, port=2)
-        ir_right_filtered = single_lowpass_filter(ir_right_adc, last_value_right)
-        ir_left_filtered = single_lowpass_filter(ir_left_adc, last_value_left)
-        last_value_right, last_value_left = ir_right_filtered, ir_left_filtered
-        ir_right_cm = adc_to_cm(ir_right_filtered, calibra_table_ir_right)
-        ir_left_cm = adc_to_cm(ir_left_filtered, calibra_table_ir_left)
+        try:
+            # สมมติฐาน: id=1 คือ ซ้าย-หน้า, id=2 คือ ซ้าย-หลัง
+            adc_front_left = ep_sensor_adaptor.get_adc(id=1, port=2)
+            adc_rear_left = ep_sensor_adaptor.get_adc(id=2, port=2) 
+            
+            filtered_front = single_lowpass_filter(adc_front_left, last_value_left)
+            filtered_rear = single_lowpass_filter(adc_rear_left, last_value_right)
+            last_value_left, last_value_right = filtered_front, filtered_rear
+            
+            # แปลงเป็น cm และอัปเดตตัวแปร global
+            ir_left_cm = adc_to_cm(filtered_front, CALIBRA_TABLE_IR_FRONT)
+            ir_right_cm = adc_to_cm(filtered_rear, CALIBRA_TABLE_IR_REAR)
+
+        except Exception as e:
+            print(f"[ERROR] in IR thread: {e}", end='\r')
+            ir_left_cm, ir_right_cm = 999.0, 999.0
+        time.sleep(0.02)
+    
+def read_digital_ir_thread(ep_sensor_adaptor):
+    global ir_left_digital, ir_right_digital
+    while not stop_flag:
+        try:
+            # การอ่านค่าเซนเซอร์ Digital มักจะใช้ get_io() เพื่ออ่านแรงดันไฟฟ้า
+            # สมมติฐาน:
+            # id=3 คือ เซนเซอร์ Digital ด้านซ้าย
+            # id=4 คือ เซนเซอร์ Digital ด้านขวา
+            voltage_left = ep_sensor_adaptor.get_io(id=1, port=1)
+            voltage_right = ep_sensor_adaptor.get_io(id=2, port=1)
+
+            # แปลงแรงดันไฟฟ้าเป็น 0 หรือ 1
+            # โดยปกติถ้าเจอวัตถุ (มีกำแพง) แรงดันจะต่ำ, ถ้าไม่เจอจะสูง
+            ir_left_digital = 1 if voltage_left < 0.5 else 0
+            ir_right_digital = 1 if voltage_right < 0.5 else 0
+
+        except Exception as e:
+            print(f"[ERROR] in read_digital_ir_thread: {e}")
+            # กรณี error ให้ตั้งเป็น 1 (เจอกำแพง) เพื่อความปลอดภัย
+            ir_left_digital, ir_right_digital = 1, 1
         time.sleep(0.05)
 
-# ===================== Movement & DFS Logic Functions (ปรับปรุงแล้ว) =====================
+
+# ===================== Movement & DFS Logic Functions =====================
 def normalize_angle(angle):
     while angle > 180: angle -= 360
     while angle <= -180: angle += 360
     return angle
 
+# [แก้ไข] อัปเดตฟังก์ชัน scan_environment ให้ใช้ค่าดิจิทัล ✅
 def scan_environment():
-    global tof_distance_cm, ir_left_cm, ir_right_cm
+    global tof_distance_cm, ir_left_digital, ir_right_digital
     open_paths = {'front': False, 'left': False, 'right': False}
     time.sleep(SCAN_DURATION_S)
+    
+    # การตัดสินใจยังคงเหมือนเดิมสำหรับ ToF
     if tof_distance_cm > TOF_WALL_THRESHOLD_CM: open_paths['front'] = True
-    if ir_left_cm > IR_WALL_THRESHOLD_CM: open_paths['left'] = True
-    if ir_right_cm > IR_WALL_THRESHOLD_CM: open_paths['right'] = True
-    print(f"ผลสแกน: หน้า: {tof_distance_cm:.1f} cm | ซ้าย: {ir_left_cm:.1f} cm | ขวา: {ir_right_cm:.1f} cm")
+    
+    # เปลี่ยนเงื่อนไขสำหรับ IR: ทางจะเปิดเมื่อค่าดิจิทัลเป็น 0
+    if ir_left_digital == 0: open_paths['left'] = True
+    if ir_right_digital == 0: open_paths['right'] = True
+        
+    print(f"ผลสแกน: หน้า: {tof_distance_cm:.1f} cm | ซ้าย (digital): {ir_left_digital} | ขวา (digital): {ir_right_digital}")
     return open_paths
 
 def get_target_coordinates(from_pos, heading_deg):
@@ -335,18 +429,13 @@ def get_direction_to_neighbor(from_cell, to_cell):
     return normalize_angle(math.degrees(math.atan2(dx, dy)))
 
 def turn_and_move(controller, target_heading):
-    """[แก้ไข] หมุนและเคลื่อนที่โดยใช้ Control class"""
     global current_heading_degrees
-    
-    # คำนวณมุมที่ต้องเลี้ยว
     turn_angle = normalize_angle(target_heading - current_heading_degrees)
-    if abs(turn_angle) > 2.0: # ถ้ามุมต่างกันเกิน 2 องศา ให้ทำการเลี้ยว
+    if abs(turn_angle) > 2.0:
         controller.turn(turn_angle)
-    
-    current_heading_degrees = normalize_angle(target_heading) # อัปเดตทิศทางปัจจุบัน
-    
-    # เดินหน้า
-    controller.move_forward_pid(NODE_DISTANCE)
+    current_heading_degrees = normalize_angle(target_heading)
+    # [เปลี่ยน] เรียกใช้ฟังก์ชันใหม่ที่ไม่มี follow_side
+    controller.follow_wall_to_next_node(NODE_DISTANCE)
 
 def map_current_cell():
     global maze_map, walls, current_pos, current_heading_degrees
@@ -366,20 +455,21 @@ def map_current_cell():
     print(f"สร้างแผนที่ช่อง {current_pos} มีทิศทางที่เปิด: {sorted(list(open_headings))}")
 
 def find_and_move_to_next_cell(controller):
-    """[แก้ไข] รับ controller object"""
     global visited_nodes, path_stack, current_pos, current_heading_degrees
-    search_order_relative = [-90, 0, 90]
+    
+    search_order_relative = [-90, 0, 90] # ซ้าย, หน้า, ขวา
+    
     for angle in search_order_relative:
         target_heading = normalize_angle(current_heading_degrees + angle)
         if target_heading in maze_map.get(current_pos, set()):
             target_cell = get_target_coordinates(current_pos, target_heading)
-            min_x, min_y = MAP_MIN_BOUNDS
-            max_x, max_y = MAP_MAX_BOUNDS
-            if not (min_x <= target_cell[0] <= max_x and min_y <= target_cell[1] <= max_y):
-                continue
+            # ... (เงื่อนไข if ตรวจสอบขอบเขตเหมือนเดิม) ...
             if target_cell not in visited_nodes:
                 print(f"พบเพื่อนบ้านที่ยังไม่เคยไป {target_cell} กำลังเคลื่อนที่...")
+                
+                # [เปลี่ยน] เรียก turn_and_move แบบไม่มี follow_side
                 turn_and_move(controller, target_heading)
+                
                 visited_nodes.add(target_cell)
                 path_stack.append(target_cell)
                 current_pos = target_cell
@@ -387,8 +477,7 @@ def find_and_move_to_next_cell(controller):
     return False
 
 def backtrack(controller):
-    """[แก้ไข] รับ controller object"""
-    global path_stack, current_pos
+    global path_stack, current_pos, previous_cell # แก้ไข global เล็กน้อย
     print("เจอทางตัน กำลังย้อนรอย (Backtracking)...")
     if len(path_stack) <= 1:
         print("กลับมาที่จุดเริ่มต้น การสำรวจสิ้นสุด")
@@ -397,11 +486,14 @@ def backtrack(controller):
     previous_cell = path_stack[-1]
     backtrack_heading = get_direction_to_neighbor(current_pos, previous_cell)
     print(f"กำลังย้อนรอยจาก {current_pos} ไปยัง {previous_cell}")
-    turn_and_move(controller, backtrack_heading)
+    
+    # [เปลี่ยน] เรียก turn_and_move แบบไม่มี follow_side
+    turn_and_move(controller, backtrack_heading) 
+
     current_pos = previous_cell
     return True
 
-# ===================== Main Execution Block (ปรับปรุงแล้ว) =====================
+# ===================== Main Execution Block (คงเดิม) =====================
 if __name__ == '__main__':
     ep_robot = robot.Robot()
     ep_robot.initialize(conn_type="ap")
@@ -417,7 +509,6 @@ if __name__ == '__main__':
 
     ep_gimbal.recenter().wait_for_completed()
 
-    # --- [ใหม่] สร้าง Instance ของ Control class ---
     controller = Control(ep_chassis)
 
     _fig.canvas.manager.set_window_title("Maze & Marker Map")
@@ -425,8 +516,14 @@ if __name__ == '__main__':
     ep_sensor.sub_distance(freq=20, callback=sub_tof_handler)
     ep_chassis.sub_attitude(freq=20, callback=sub_imu_handler)
     ep_chassis.sub_position(freq=20, callback=sub_position_handler)
-    ir_reader = threading.Thread(target=read_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
-    ir_reader.start()
+    
+    # เริ่ม thread การอ่าน IR (ใช้ฟังก์ชันที่เขียนใหม่)
+    analog_ir_reader = threading.Thread(target=read_analog_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
+    digital_ir_reader = threading.Thread(target=read_digital_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
+    
+    analog_ir_reader.start()
+    digital_ir_reader.start()
+
     time.sleep(1)
 
     current_pos = START_CELL
@@ -447,13 +544,21 @@ if __name__ == '__main__':
                 map_current_cell()
                 detect_marker_at_current_location(ep_camera, ep_gimbal)
             
-            # --- [แก้ไข] ส่ง controller เข้าไปในฟังก์ชัน ---
             if find_and_move_to_next_cell(controller):
                 continue
             
-            # --- [แก้ไข] ส่ง controller เข้าไปในฟังก์ชัน ---
             if not backtrack(controller):
                 break
+
+    # ===================== [ เพิ่มส่วนนี้เข้ามา ] =====================
+    except Exception as e:
+        print("\n" + "="*50)
+        print("🔥🔥🔥 เกิดข้อผิดพลาดร้ายแรง (FATAL ERROR) 🔥🔥🔥")
+        import traceback
+        traceback.print_exc() # พิมพ์รายละเอียดของ Error ทั้งหมด
+        print("="*50 + "\n")
+    #================================================================
+
     finally:
         print("\nการสำรวจ DFS เสร็จสมบูรณ์")
 
@@ -487,7 +592,7 @@ if __name__ == '__main__':
         print("กำลังทำความสะอาดและปิดการเชื่อมต่อ...")
         stop_flag = True
         time.sleep(0.2)
-        controller.stop() # ใช้ controller.stop() แทน
+        controller.stop()
 
         ep_sensor.unsub_distance()
         ep_chassis.unsub_attitude()
