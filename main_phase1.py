@@ -8,9 +8,9 @@ import numpy as np
 import cv2
 import json
 
-START_CELL = (0, 2)             # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
+START_CELL = (0, 0)             # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
 MAP_MIN_BOUNDS = (0, 0)         # พิกัดซ้าย-ล่างสุดของแผนที่
-MAP_MAX_BOUNDS = (5, 5)         # พิกัดขวา-บนสุดของแผนที่
+MAP_MAX_BOUNDS = (3, 3)         # พิกัดขวา-บนสุดของแผนที่
 NODE_DISTANCE = 0.6             # ระยะห่างระหว่าง Node (เมตร)
 
 # ===================== PID Controller Class (คงเดิม) =====================
@@ -50,7 +50,7 @@ class Control:
         self.ep_chassis.move(x=0, y=0, z=-angle_deg, z_speed=45).wait_for_completed()
         time.sleep(0.5)
 
-    def move_forward_pid(self, cell_size_m, Kp=3, Ki=0.0001, Kd=0.001, v_clip=0.4, tol_m=0.02):
+    def move_forward_pid(self, cell_size_m, Kp=3, Ki=0.0001, Kd=0.001, v_clip=0.4, tol_m=0.02):                    # ปรับความเร็วเดินหน้า
         global current_x, current_y
         print(f"Action: Moving forward {cell_size_m} m using PID")
         pid = PIDController(Kp=Kp, Ki=Ki, Kd=Kd, setpoint=cell_size_m)
@@ -234,7 +234,7 @@ last_value_right = 0
 CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
 CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
 
-TARGET_WALL_DISTANCE_CM = 8.5  # ระยะห่างที่ต้องการจากกำแพง
+TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างที่ต้องการจากกำแพง
 BASE_FORWARD_SPEED_WF = 0.25    # ความเร็วเดินหน้าพื้นฐานตอนตามกำแพง
 MAX_Y_SPEED = 0.3               # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง
 MAX_Z_SPEED = 32.0              # ความเร็วสูงสุดในการหมุนตัว
@@ -364,7 +364,7 @@ def _process_frame_for_markers(frame, all_found_targets):
 
 def detect_marker_optimized_scan(ep_camera, ep_gimbal):
     """
-    [เวอร์ชัน Final] สแกนหา Marker แบบ กลาง -> ซ้าย -> ขวา
+    [เวอร์ชัน Final] สแกนหา Marker แบบ กลาง -> ซ้าย -> ขวา (ปรับเป็น 90 องศา พร้อมก้ม)
     และสามารถบันทึก Marker ได้หลายอันพร้อมระบุตำแหน่งที่เจอ (side)
     """
     global markers_found, current_pos
@@ -373,8 +373,6 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
         print(f"[{current_pos}] เคยสแกนตำแหน่งนี้แล้ว. ข้ามการสแกนซ้ำ")
         return
 
-    # ใช้ Dictionary เพื่อเก็บ Marker ที่เจอในรอบนี้ ป้องกันการเจอ Marker ซ้ำซ้อน
-    # Key คือ "สี_รูปทรง" value คือข้อมูล Marker ที่ดีที่สุด (ใหญ่ที่สุด) ที่เจอ
     found_this_scan = {} 
     
     try:
@@ -387,37 +385,34 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
             if angle == 0:
                 ep_gimbal.recenter().wait_for_completed()
             else:
-                # คำนวณความเร็วในการหมุนตามระยะทาง
-                speed = 120 if abs(angle) <= 45 else 180
-                ep_gimbal.move(yaw=angle, pitch=0, yaw_speed=speed).wait_for_completed()
+                # <<< [แก้ไข] สั่งให้หมุน (yaw) ไปยังมุมที่ต้องการ พร้อมกับก้ม (pitch) ลง 20 องศา
+                ep_gimbal.move(yaw=angle, pitch=-20, yaw_speed=180).wait_for_completed()
             
             time.sleep(1.0)
             frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
             if frame is None: return
 
-            # วนลูปหา Marker ทุกสีในภาพ
+            # วนลูปหา Marker ทุกสีในภาพ (ส่วนนี้เหมือนเดิม)
             for color in ['red', 'green', 'blue', 'yellow']:
                 mask = detect_color_mask(frame, color)
                 target = find_largest_target(mask)
                 if target:
                     target_id = f"{color}_{target['shape']}"
-                    # ถ้าเจอ Marker ชนิดใหม่ หรือเจอชนิดเดิมแต่ใหญ่กว่า (ชัดกว่า) ให้อัปเดต
                     if target_id not in found_this_scan or target['area'] > found_this_scan[target_id]['area']:
                         found_this_scan[target_id] = {
                             'color': color,
                             'shape': target['shape'],
-                            'side': side_name, # << บันทึกว่าเจอจากด้านไหน
-                            'area': target['area'] # เก็บ area ไว้เปรียบเทียบ
+                            'side': side_name,
+                            'area': target['area']
                         }
         
         # --- เริ่มกระบวนการสแกน ---
         scan_and_process('center', 0)
-        scan_and_process('left', -45)
-        scan_and_process('right', 45)
+        scan_and_process('left', -90)   # <<< [แก้ไข] เปลี่ยนจาก -45 เป็น -90
+        scan_and_process('right', 90)  # <<< [แก้ไข] เปลี่ยนจาก 45 เป็น 90
 
-        # --- สรุปผลการสแกน ---
+        # --- สรุปผลการสแกน (ส่วนนี้เหมือนเดิม) ---
         if found_this_scan:
-            # แปลง Dictionary กลับเป็น List ของ Marker (โดยไม่เอา area มาด้วย)
             final_markers = [dict(list(v.items())[:-1]) for v in found_this_scan.values()]
             markers_found[current_pos] = final_markers
             print(f"!!! [{current_pos}] ตรวจพบ Marker ทั้งหมด {len(final_markers)} ชิ้น:")
@@ -644,18 +639,25 @@ def get_direction_to_neighbor(from_cell, to_cell):
     return normalize_angle(math.degrees(math.atan2(dx, dy)))
 
 def turn_and_move(controller, target_heading):
-    global current_heading_degrees
+    global current_heading_degrees, ir_left_digital # เพิ่ม ir_left_digital เข้ามาใน global
+
+    # ส่วนของการหมุนตัวยังคงเหมือนเดิม
     turn_angle = normalize_angle(target_heading - current_heading_degrees)
     if abs(turn_angle) > 2.0:
         controller.turn(turn_angle)
     current_heading_degrees = normalize_angle(target_heading)
 
-    # --- [ส่วนที่แก้ไขหลัก] ---
-    # 1. เรียกใช้ฟังก์ชันจัดตำแหน่งให้ขนานกับกำแพงก่อน
-    controller.align_with_left_wall()
+    # --- <<< [ส่วนที่แก้ไขหลัก] เพิ่มเงื่อนไขตรวจสอบกำแพง >>> ---
     
-    # 2. หลังจากจัดตำแหน่งแล้ว ค่อยสั่งเดินหน้าตรงๆ ด้วย PID
-    controller.move_forward_pid(NODE_DISTANCE)
+    # 1. ตรวจสอบว่ามีกำแพงด้านซ้ายหรือไม่ (ir_left_digital == 1)
+    if ir_left_digital == 1:
+        # ถ้ามีกำแพง: ให้ใช้โหมดเดินตามกำแพง ซึ่งจะทั้งจัดตำแหน่งและเคลื่อนที่ไปพร้อมกัน
+        print("Path has a left wall. Engaging wall-following mode...")
+        controller.follow_wall_to_next_node(NODE_DISTANCE)
+    else:
+        # ถ้าไม่มีกำแพง (ที่โล่ง): ให้ใช้โหมดเดินหน้าตรงๆ แบบปกติ
+        print("Path is open on the left. Using standard PID forward movement...")
+        controller.move_forward_pid(NODE_DISTANCE)
 
 def map_current_cell():
     global maze_map, walls, current_pos, current_heading_degrees

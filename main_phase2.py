@@ -302,8 +302,10 @@ def get_heading_to_next_step(current_pos, next_pos):
 
 def follow_path_optimized(controller, path, initial_heading):
     """
-    ควบคุมหุ่นยนต์ให้เดินตามเส้นทาง (เวอร์ชันใหม่ที่รวมทางตรงเป็นเส้นเดียว)
+    ควบคุมหุ่นยนต์ให้เดินตามเส้นทาง (เวอร์ชันใหม่ที่รวมทางตรงและเลือกโหมดอัตโนมัติ)
     """
+    global ir_left_cm # <<< เพิ่มเข้ามาเพื่อเข้าถึงค่าจากเซนเซอร์
+
     if not path or len(path) < 2:
         print("เส้นทางไม่ถูกต้อง ไม่สามารถเดินได้")
         return initial_heading
@@ -317,34 +319,37 @@ def follow_path_optimized(controller, path, initial_heading):
         # 1. คำนวณทิศทางสำหรับก้าวแรก
         initial_target_heading = get_heading_to_next_step(current_pos, path[path_index + 1])
         
-        # 2. มองไปข้างหน้าเพื่อหาว่ามีทางตรงยาวแค่ไหน
+        # 2. มองไปข้างหน้าเพื่อหาว่ามีทางตรงยาวแค่ไหน (ส่วนนี้คงเดิม)
         straight_steps = 1
         for i in range(path_index + 1, len(path) - 1):
-            # คำนวณทิศทางของก้าวถัดๆ ไป
             next_heading = get_heading_to_next_step(path[i], path[i+1])
             if next_heading == initial_target_heading:
-                # ถ้าทิศทางเหมือนเดิม แสดงว่าเป็นทางตรง
                 straight_steps += 1
             else:
-                # ถ้าทิศทางเปลี่ยน แสดงว่าทางตรงสิ้นสุดแล้ว
                 break
         
-        # 3. คำนวณระยะทางรวมที่ต้องเดิน
+        # 3. คำนวณระยะทางรวมที่ต้องเดิน (ส่วนนี้คงเดิม)
         total_distance = straight_steps * NODE_DISTANCE
         print(f"\nพบทางตรง! จะเดินจาก {current_pos} เป็นระยะทาง {total_distance:.2f} m ({straight_steps} ช่อง)")
 
-        # 4. หันไปยังทิศทางที่ถูกต้อง
+        # 4. หันไปยังทิศทางที่ถูกต้อง (ส่วนนี้คงเดิม)
         turn_angle = normalize_angle(initial_target_heading - robot_current_heading)
         if abs(turn_angle) > 5.0:
             controller.turn(turn_angle)
         robot_current_heading = normalize_angle(initial_target_heading)
+        time.sleep(0.5) # << เพิ่ม sleep เล็กน้อยเพื่อให้หุ่นนิ่งและเซนเซอร์อ่านค่าได้เสถียร
 
-        # --- [ส่วนที่แก้ไขหลัก] ---
-        # 5. จัดตำแหน่งให้ขนานกับกำแพงก่อน แล้วค่อยเดินหน้าตรง
-        controller.align_with_left_wall()
-        controller.move_forward_pid(total_distance)
+        # --- <<< [ส่วนที่แก้ไขหลัก] >>> ---
+        # 5. ตรวจสอบว่ามีกำแพงด้านซ้ายหรือไม่ เพื่อเลือกโหมดการเคลื่อนที่
+        # เราจะถือว่ามีกำแพงถ้าเซนเซอร์วัดระยะได้น้อยกว่า 25 cm (ไม่ใช่ค่า default 999)
+        if ir_left_cm < 25.0:
+            print(f"Path has a left wall (IR Left: {ir_left_cm:.1f} cm). Engaging wall-following mode...")
+            controller.follow_wall_to_next_node(total_distance)
+        else:
+            print(f"Path is open on the left (IR Left: {ir_left_cm:.1f} cm). Using standard PID forward movement...")
+            controller.move_forward_pid(total_distance)
         
-        # 6. อัปเดตตำแหน่งใน path ไปยังจุดสุดท้ายของทางตรง
+        # 6. อัปเดตตำแหน่งใน path ไปยังจุดสุดท้ายของทางตรง (ส่วนนี้คงเดิม)
         path_index += straight_steps
 
     return robot_current_heading
