@@ -116,6 +116,59 @@ class Control:
         print("[WARNING] follow_wall_to_next_node timed out. Stopping robot.")
         self.stop()
 
+    def dash_forward(self):
+        """
+        โหมดวิ่งทางตรง: เดินหน้าต่อเนื่องด้วยความเร็วสูง
+        จะหยุดเมื่อ: 1. เจทางแยก 2. เจอ Marker 3. เจอทางตัน
+        """
+        global current_x, current_y, ir_left_digital, ir_right_digital, marker_sighted_flag, tof_distance_cm
+
+        print("Action (Dash): Starting high-speed forward movement.")
+        # ใช้ค่า PID ที่ตอบสนองเร็วขึ้นสำหรับความเร็วสูง
+        pid_angle = PIDController(Kp=18.0, Ki=0.0001, Kd=0.0005, setpoint=0)
+        pid_dist = PIDController(Kp=0.015, Ki=0.0, Kd=0.002, setpoint=TARGET_WALL_DISTANCE_CM)
+        sx, sy = current_x, current_y
+        
+        marker_sighted_flag.clear() # รีเซ็ตสัญญาณ Marker ก่อนเริ่มวิ่ง
+
+        while not stop_flag:
+            dist_traveled = math.hypot(current_x - sx, current_y - sy)
+
+            # --- ตรวจสอบเงื่อนไขการหยุด ---
+            # 1. หยุดเมื่อเจอทางแยก
+            if ir_left_digital == 0 or ir_right_digital == 0:
+                print(f"\n[!] Junction detected at {dist_traveled:.2f} m. Stopping.")
+                target_dist = math.ceil(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
+                if target_dist - dist_traveled < 0.1 and target_dist > 0: target_dist += NODE_DISTANCE
+                self.follow_wall_to_next_node(target_dist - dist_traveled) # เดินส่วนที่เหลือให้ถึงโหนด
+                return "JUNCTION"
+
+            # 2. หยุดเมื่อ Marker Spotter ส่งสัญญาณมา
+            if marker_sighted_flag.is_set():
+                print(f"\n[!] Marker sighted at {dist_traveled:.2f} m. Stopping.")
+                target_dist = round(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
+                self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15) # เดินช้าๆ ให้ถึงโหนด
+                return "MARKER_SIGHTED"
+
+            # 3. หยุดเมื่อเจอทางตัน (ToF)
+            if tof_distance_cm < TOF_WALL_THRESHOLD_CM:
+                 print(f"\n[!] Dead end detected at {dist_traveled:.2f} m. Stopping.")
+                 target_dist = round(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
+                 self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15)
+                 return "DEAD_END"
+
+            # --- การควบคุมการเคลื่อนที่ (ถ้าไม่เจออะไร) ---
+            ir_front, ir_rear = ir_left_cm, ir_right_cm
+            angle_error = ir_front - ir_rear
+            dist_error = TARGET_WALL_DISTANCE_CM - ((ir_front + ir_rear) / 2.0)
+            z_speed = np.clip(pid_angle.compute(angle_error), -MAX_Z_SPEED, MAX_Z_SPEED)
+            y_speed = np.clip(pid_dist.compute(dist_error), -MAX_Y_SPEED, MAX_Y_SPEED)
+            self.ep_chassis.drive_speed(x=DASH_SPEED_WF, y=y_speed, z=z_speed, timeout=0.1)
+            time.sleep(0.02)
+        
+        self.stop()
+        return "STOPPED"
+
 # ===================== Global State & Constants [แก้ไข] =====================
 stop_flag = False
 tof_distance_cm = 999.0
@@ -150,10 +203,17 @@ current_pos = (1, 1)
 current_heading_degrees = 0
 markers_found = {}
 
+# ==========================================================
+# <<< 1. เพิ่มส่วนนี้เข้ามาใหม่ >>>
+# ==========================================================
+# --- ตัวแปรสำหรับโหมดอัจฉริยะ ---
+ROBOT_MODE = "EXPLORE"  # โหมดเริ่มต้น: EXPLORE, DASH
+marker_sighted_flag = threading.Event() # ใช้เป็นสัญญาณว่าเจอ Marker
+DASH_SPEED_WF = 0.45 # ความเร็วสูงขึ้นสำหรับ Dash Mode
+
 SCAN_DURATION_S = 0.2
 TOF_WALL_THRESHOLD_CM = 50
-# [ลบ] IR_WALL_THRESHOLD_CM ไม่จำเป็นอีกต่อไป
-# IR_WALL_THRESHOLD_CM = 30 
+TOF_DASH_THRESHOLD_CM = 120.0 # ระยะ (cm) ที่จะถือว่าเป็นทางตรงยาว
 START_CELL = (0, 0)
 MAP_MIN_BOUNDS = (0, 0)
 MAP_MAX_BOUNDS = (3, 3)
@@ -239,44 +299,102 @@ def find_largest_target(mask):
     if not valid_targets: return None
     return max(valid_targets, key=lambda x: x['area'])
 
-def detect_marker_at_current_location(ep_camera, ep_gimbal):
-    global markers_found, current_pos
-    print(f"[{current_pos}] กำลังตรวจจับ Marker...")
-    if current_pos in markers_found:
-        print(f"[{current_pos}] เคยตรวจพบ Marker แล้ว. ข้ามการตรวจจับซ้ำ")
+def _process_frame_for_markers(frame, all_found_targets):
+    """
+    ฟังก์ชันย่อย: ทำหน้าที่วิเคราะห์ภาพ 1 frame เพื่อหา Marker ทุกสี
+    และอัปเดตผลลัพธ์ลงใน all_found_targets
+    """
+    if frame is None:
         return
+
+    # วนลูปหา Marker ทุกสีในภาพนั้น
+    for color in ['red', 'green', 'blue', 'yellow']:
+        mask = detect_color_mask(frame, color)
+        target = find_largest_target(mask)
+        if target:
+            # เก็บ target ที่ดีที่สุด โดยเทียบกับของเดิมที่เคยเจอ
+            target_id = f"{color}_{target['shape']}"
+            if target_id not in all_found_targets or target['area'] > all_found_targets[target_id]['area']:
+                target['color'] = color
+                all_found_targets[target_id] = target
+
+def detect_marker_optimized_scan(ep_camera, ep_gimbal):
+    """
+    [เวอร์ชัน Final] สแกนหา Marker แบบ กลาง -> ซ้าย -> ขวา
+    และสามารถบันทึก Marker ได้หลายอันพร้อมระบุตำแหน่งที่เจอ (side)
+    """
+    global markers_found, current_pos
+    print(f"[{current_pos}] กำลังสแกนหา Marker แบบ Multi-Detection (กลาง->ซ้าย->ขวา)...")
+    if current_pos in markers_found:
+        print(f"[{current_pos}] เคยสแกนตำแหน่งนี้แล้ว. ข้ามการสแกนซ้ำ")
+        return
+
+    # ใช้ Dictionary เพื่อเก็บ Marker ที่เจอในรอบนี้ ป้องกันการเจอ Marker ซ้ำซ้อน
+    # Key คือ "สี_รูปทรง" value คือข้อมูล Marker ที่ดีที่สุด (ใหญ่ที่สุด) ที่เจอ
+    found_this_scan = {} 
+    
     try:
         ep_camera.start_video_stream(display=False, resolution='480p')
-        ep_gimbal.recenter().wait_for_completed()
-        time.sleep(1)
-        frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
-        if frame is None:
-            print("ไม่สามารถอ่านภาพจากกล้องได้")
-            return
-        found_targets = {}
-        for color in ['red', 'green', 'blue', 'yellow']:
-            mask = detect_color_mask(frame, color)
-            target = find_largest_target(mask)
-            if target:
-                target['color'] = color
-                found_targets[f"{color}_{target['shape']}"] = target
-        if found_targets:
-            best_target = max(found_targets.values(), key=lambda x: x['area'])
-            color, shape = best_target['color'], best_target['shape']
-            markers_found[current_pos] = {'color': color, 'shape': shape}
-            print(f"!!! [{current_pos}] ตรวจพบ Marker: สี {color.upper()}, รูปทรง {shape.upper()} !!!")
+        time.sleep(0.5)
+
+        # --- สร้างฟังก์ชันย่อยเพื่อลดการเขียนโค้ดซ้ำ ---
+        def scan_and_process(side_name, angle):
+            print(f"  -> กำลังสแกนด้าน {side_name} ({angle}°)...")
+            if angle == 0:
+                ep_gimbal.recenter().wait_for_completed()
+            else:
+                # คำนวณความเร็วในการหมุนตามระยะทาง
+                speed = 120 if abs(angle) <= 45 else 180
+                ep_gimbal.move(yaw=angle, pitch=0, yaw_speed=speed).wait_for_completed()
+            
+            time.sleep(1.0)
+            frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
+            if frame is None: return
+
+            # วนลูปหา Marker ทุกสีในภาพ
+            for color in ['red', 'green', 'blue', 'yellow']:
+                mask = detect_color_mask(frame, color)
+                target = find_largest_target(mask)
+                if target:
+                    target_id = f"{color}_{target['shape']}"
+                    # ถ้าเจอ Marker ชนิดใหม่ หรือเจอชนิดเดิมแต่ใหญ่กว่า (ชัดกว่า) ให้อัปเดต
+                    if target_id not in found_this_scan or target['area'] > found_this_scan[target_id]['area']:
+                        found_this_scan[target_id] = {
+                            'color': color,
+                            'shape': target['shape'],
+                            'side': side_name, # << บันทึกว่าเจอจากด้านไหน
+                            'area': target['area'] # เก็บ area ไว้เปรียบเทียบ
+                        }
+        
+        # --- เริ่มกระบวนการสแกน ---
+        scan_and_process('center', 0)
+        scan_and_process('left', -45)
+        scan_and_process('right', 45)
+
+        # --- สรุปผลการสแกน ---
+        if found_this_scan:
+            # แปลง Dictionary กลับเป็น List ของ Marker (โดยไม่เอา area มาด้วย)
+            final_markers = [dict(list(v.items())[:-1]) for v in found_this_scan.values()]
+            markers_found[current_pos] = final_markers
+            print(f"!!! [{current_pos}] ตรวจพบ Marker ทั้งหมด {len(final_markers)} ชิ้น:")
+            for m in final_markers:
+                print(f"    - สี {m['color'].upper()}, รูปทรง {m['shape'].upper()} (ที่ด้าน {m['side']})")
         else:
-            print(f"[{current_pos}] ไม่พบ Marker ในบริเวณนี้")
+            print(f"[{current_pos}] ไม่พบ Marker ใดๆ จากการสแกน")
+
     except Exception as e:
-        print(f"เกิดข้อผิดพลาดระหว่างการตรวจจับ Marker: {e}")
+        print(f"เกิดข้อผิดพลาดระหว่างการสแกน Marker: {e}")
     finally:
+        ep_gimbal.recenter().wait_for_completed()
         ep_camera.stop_video_stream()
         print("ปิดการใช้งานกล้อง")
 
 def plot_maze(walls_to_plot, visited_to_plot, path_stack_to_plot, current_cell_to_plot, markers_to_plot, title="Maze Exploration"):
     _ax.clear()
-    MAZE_BOUNDS_PLOT = (0, 3, 0, 3)
+    MAZE_BOUNDS_PLOT = (0, 3, 0, 3) # ควรปรับตามขนาดแผนที่จริง
     x_min, x_max, y_min, y_max = MAZE_BOUNDS_PLOT
+    
+    # ... (ส่วนของการวาด maze, path, robot เหมือนเดิม) ...
     for x, y in visited_to_plot:
         _ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor='lightcyan', edgecolor='none', zorder=0))
     for wall in walls_to_plot:
@@ -290,15 +408,33 @@ def plot_maze(walls_to_plot, visited_to_plot, path_stack_to_plot, current_cell_t
     if len(path_stack_to_plot) > 1:
         path_x, path_y = zip(*path_stack_to_plot)
         _ax.plot(path_x, path_y, 'b-o', markersize=4, zorder=1)
+    
+    # --- [ส่วนที่แก้ไข] ---
     marker_symbols = {'circle': 'o', 'square': 's', 'vertical_rectangle': '|', 'horizontal_rectangle': '_'}
     color_map = {'red': 'r', 'green': 'g', 'blue': 'b', 'yellow': 'y'}
-    for pos, data in markers_to_plot.items():
-        mx, my = pos
-        shape_symbol = marker_symbols.get(data['shape'], '*')
-        marker_color = color_map.get(data['color'], 'k')
-        _ax.plot(mx, my, marker=shape_symbol, color=marker_color, markersize=15, linestyle='None', zorder=3)
+    
+    # วนลูปสำหรับแต่ละตำแหน่ง (cell) ที่มี Marker
+    for pos, marker_list in markers_to_plot.items():
+        cell_x, cell_y = pos
+        # วนลูปสำหรับ Marker แต่ละอันใน List ของตำแหน่งนั้น
+        for marker_data in marker_list:
+            shape_symbol = marker_symbols.get(marker_data['shape'], '*')
+            marker_color = color_map.get(marker_data['color'], 'k')
+            side = marker_data.get('side', 'center') # get side, default to 'center'
+            
+            # กำหนดตำแหน่ง offset ในการวาด
+            x_offset = 0
+            if side == 'left':
+                x_offset = -0.25
+            elif side == 'right':
+                x_offset = 0.25
+            
+            # วาด Marker ตามตำแหน่งที่คำนวณได้
+            _ax.plot(cell_x + x_offset, cell_y, marker=shape_symbol, color=marker_color, markersize=12, linestyle='None', zorder=3)
+
     cx, cy = current_cell_to_plot
     _ax.plot(cx, cy, 'ro', markersize=12, label='Robot', zorder=2)
+    # ... (ส่วนของการตั้งค่า plot ที่เหลือเหมือนเดิม) ...
     _ax.set_xlim(x_min - 0.5, x_max + 0.5)
     _ax.set_ylim(y_min - 0.5, y_max + 0.5)
     _ax.set_aspect('equal', adjustable='box')
@@ -391,6 +527,41 @@ def read_digital_ir_thread(ep_sensor_adaptor):
             ir_left_digital, ir_right_digital = 1, 1
         time.sleep(0.05)
 
+def marker_spotter_thread(ep_camera):
+    """
+    Thread ที่ทำงานเบื้องหลังเพื่อส่องหา Marker อย่างรวดเร็วระหว่างที่หุ่นวิ่ง
+    """
+    global marker_sighted_flag, ROBOT_MODE, stop_flag
+    
+    while not stop_flag:
+        if ROBOT_MODE != "DASH":
+            time.sleep(0.5)
+            continue
+        
+        try:
+            frame = ep_camera.read_cv2_image(strategy="newest", timeout=0.5)
+            if frame is None: continue
+            
+            # ตรวจสอบแบบเร็วๆ แค่ว่ามีสีที่ต้องการในภาพหรือไม่
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            for color in COLOR_RANGES.keys():
+                mask = cv2.inRange(hsv, COLOR_RANGES[color][0]['lower'], COLOR_RANGES[color][0]['upper'])
+                # สำหรับสีแดง ต้องรวม 2 ช่วง
+                if color == 'red' and len(COLOR_RANGES[color]) > 1:
+                     mask2 = cv2.inRange(hsv, COLOR_RANGES[color][1]['lower'], COLOR_RANGES[color][1]['upper'])
+                     mask = cv2.bitwise_or(mask, mask2)
+                
+                # ถ้ามีพื้นที่สีมากกว่า threshold ให้ส่งสัญญาณ
+                if cv2.countNonZero(mask) > 2000: # Threshold พื้นที่สี
+                    print(f"\nSpotter: Potential {color} marker detected!")
+                    marker_sighted_flag.set() # ส่งสัญญาณให้ dash_forward หยุด
+                    time.sleep(1) # หยุดชั่วคราวหลังเจอ
+                    break 
+        except Exception as e:
+            print(f"Spotter Error: {e}")
+        
+        time.sleep(0.1)
+
 
 # ===================== Movement & DFS Logic Functions =====================
 def normalize_angle(angle):
@@ -454,27 +625,64 @@ def map_current_cell():
     maze_map[current_pos] = open_headings
     print(f"สร้างแผนที่ช่อง {current_pos} มีทิศทางที่เปิด: {sorted(list(open_headings))}")
 
-def find_and_move_to_next_cell(controller):
-    global visited_nodes, path_stack, current_pos, current_heading_degrees
-    
-    search_order_relative = [-90, 0, 90] # ซ้าย, หน้า, ขวา
-    
-    for angle in search_order_relative:
+def find_and_move_to_next_cell(controller, ep_camera, ep_gimbal):
+    global visited_nodes, current_pos, current_heading_degrees
+
+    # --- ตรรกะการตัดสินใจเข้า Dash Mode (แบบปกติ) ---
+    target_heading_front = normalize_angle(current_heading_degrees)
+    if target_heading_front in maze_map.get(current_pos, set()):
+        target_cell_front = get_target_coordinates(current_pos, target_heading_front)
+        if target_cell_front not in visited_nodes:
+            # ถ้าเงื่อนไขปกติผ่าน ให้เรียกฟังก์ชัน Dash
+            _execute_dash_and_update_map(controller, ep_camera, ep_gimbal)
+            return True # บอก main loop ว่ามีการเคลื่อนที่แล้ว
+
+    # --- ตรรกะเดิม: ถ้า Dash ไม่ได้ ให้หาทางเลี้ยว (Explore Mode) ---
+    for angle in [-90, 90]: # หาทางซ้าย-ขวา
         target_heading = normalize_angle(current_heading_degrees + angle)
         if target_heading in maze_map.get(current_pos, set()):
             target_cell = get_target_coordinates(current_pos, target_heading)
-            # ... (เงื่อนไข if ตรวจสอบขอบเขตเหมือนเดิม) ...
             if target_cell not in visited_nodes:
-                print(f"พบเพื่อนบ้านที่ยังไม่เคยไป {target_cell} กำลังเคลื่อนที่...")
-                
-                # [เปลี่ยน] เรียก turn_and_move แบบไม่มี follow_side
+                print(f"Found unvisited neighbor at {target_cell}, moving...")
                 turn_and_move(controller, target_heading)
-                
                 visited_nodes.add(target_cell)
                 path_stack.append(target_cell)
                 current_pos = target_cell
                 return True
     return False
+
+def _execute_dash_and_update_map(controller, ep_camera, ep_gimbal):
+    """
+    ฟังก์ชันสำหรับเริ่มการ Dash และอัปเดตแผนที่ตามผลลัพธ์ที่ได้
+    """
+    global ROBOT_MODE, current_pos, visited_nodes, path_stack, current_heading_degrees, current_x, current_y
+    
+    ROBOT_MODE = "DASH"
+    ep_camera.start_video_stream(display=False, resolution='480p')
+    ep_gimbal.recenter().wait_for_completed()
+    time.sleep(0.5)
+
+    stop_reason = controller.dash_forward() # เริ่มวิ่ง
+    
+    ep_camera.stop_video_stream()
+    ROBOT_MODE = "EXPLORE" # กลับสู่โหมดปกติเสมอ
+
+    # อัปเดตแผนที่ตามระยะทางที่วิ่งได้จริง
+    # (โค้ดส่วนนี้ยกมาจาก find_and_move_to_next_cell ของเดิม)
+    start_pos_coords = (path_stack[-1][0] * NODE_DISTANCE, path_stack[-1][1] * NODE_DISTANCE)
+    dist_traveled = math.hypot(current_x - start_pos_coords[0], current_y - start_pos_coords[1])
+    nodes_traveled = int(round(dist_traveled / NODE_DISTANCE))
+    
+    print(f"Dash moved {nodes_traveled} nodes.")
+    # อัปเดต path stack และ visited nodes ตามจำนวนช่องที่เคลื่อนที่ได้
+    for i in range(nodes_traveled):
+        last_pos = path_stack[-1]
+        next_pos = get_target_coordinates(last_pos, current_heading_degrees)
+        if next_pos in visited_nodes: break
+        visited_nodes.add(next_pos)
+        path_stack.append(next_pos)
+    
+    current_pos = path_stack[-1] # อัปเดตตำแหน่งปัจจุบัน
 
 def backtrack(controller):
     global path_stack, current_pos, previous_cell # แก้ไข global เล็กน้อย
@@ -498,105 +706,114 @@ if __name__ == '__main__':
     ep_robot = robot.Robot()
     ep_robot.initialize(conn_type="ap")
 
-    ep_robot.set_robot_mode(mode=robot.CHASSIS_LEAD)
-    print("ตั้งค่า Robot Mode เป็น CHASSIS_LEAD เรียบร้อยแล้ว")
-
     ep_chassis = ep_robot.chassis
     ep_sensor = ep_robot.sensor
     ep_gimbal = ep_robot.gimbal
     ep_sensor_adaptor = ep_robot.sensor_adaptor
     ep_camera = ep_robot.camera
 
+    ep_robot.set_robot_mode(mode=robot.CHASSIS_LEAD)
     ep_gimbal.recenter().wait_for_completed()
-
     controller = Control(ep_chassis)
 
-    _fig.canvas.manager.set_window_title("Maze & Marker Map")
-
+    # Subscribe to sensors
     ep_sensor.sub_distance(freq=20, callback=sub_tof_handler)
     ep_chassis.sub_attitude(freq=20, callback=sub_imu_handler)
-    ep_chassis.sub_position(freq=20, callback=sub_position_handler)
-    
-    # เริ่ม thread การอ่าน IR (ใช้ฟังก์ชันที่เขียนใหม่)
+    ep_chassis.sub_position(freq=5, callback=sub_position_handler)
+
+    # Start sensor threads
     analog_ir_reader = threading.Thread(target=read_analog_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
     digital_ir_reader = threading.Thread(target=read_digital_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
-    
     analog_ir_reader.start()
     digital_ir_reader.start()
 
+    # <<< เพิ่มเข้ามาใหม่ >>>
+    # เริ่ม Thread สำหรับส่องหา Marker
+    marker_spotter = threading.Thread(target=marker_spotter_thread, args=(ep_camera,), daemon=True)
+    marker_spotter.start()
+
     time.sleep(1)
 
+    # Initialize DFS
     current_pos = START_CELL
     visited_nodes.add(current_pos)
     path_stack.append(current_pos)
     
-    print("เริ่มต้นการสำรวจเขาวงกต และค้นหา Marker...")
+    print("Starting Smart Maze Exploration...")
     
     try:
         while path_stack and not stop_flag:
             if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
-                print("กดปุ่ม ESC กำลังหยุดการทำงาน...")
+                print("ESC pressed, stopping...")
+                stop_flag = True
                 break
 
-            print(f"\nตำแหน่ง: {current_pos}, ทิศทาง: {current_heading_degrees}°")
+            print(f"\n--- Current Position: {current_pos}, Heading: {current_heading_degrees}° ---")
 
             if current_pos not in maze_map:
                 map_current_cell()
-                detect_marker_at_current_location(ep_camera, ep_gimbal)
+                detect_marker_optimized_scan(ep_camera, ep_gimbal)
+                # วาดแผนที่ทุกครั้งหลังสแกนเสร็จ
+                #plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found)
+
+            # --- [LOGIC การตัดสินใจที่ปรับปรุงใหม่] ---
             
-            if find_and_move_to_next_cell(controller):
+            # 1. เช็คเงื่อนไข Dash ด้วย ToF ก่อนเป็นอันดับแรก
+            can_dash_forward = normalize_angle(current_heading_degrees) in maze_map.get(current_pos, set())
+            next_cell_is_unvisited = get_target_coordinates(current_pos, current_heading_degrees) not in visited_nodes
+
+            if can_dash_forward and next_cell_is_unvisited and tof_distance_cm > TOF_DASH_THRESHOLD_CM:
+                print(f"\n[!] Long corridor detected (ToF: {tof_distance_cm:.1f} cm). Proactively entering DASH mode.")
+                _execute_dash_and_update_map(controller, ep_camera, ep_gimbal)
+                continue
+
+            # 2. ถ้า Dash ด้วย ToF ไม่ได้ ให้ใช้ตรรกะการหาเส้นทางปกติ
+            elif find_and_move_to_next_cell(controller, ep_camera, ep_gimbal):
                 continue
             
-            if not backtrack(controller):
+            # 3. ถ้าไปต่อไม่ได้จริงๆ ให้ Backtrack
+            elif not backtrack(controller):
                 break
 
-    # ===================== [ เพิ่มส่วนนี้เข้ามา ] =====================
-    except Exception as e:
-        print("\n" + "="*50)
-        print("🔥🔥🔥 เกิดข้อผิดพลาดร้ายแรง (FATAL ERROR) 🔥🔥🔥")
+    except (KeyboardInterrupt, Exception) as e:
+        print(f"\nAn error occurred: {e}")
         import traceback
-        traceback.print_exc() # พิมพ์รายละเอียดของ Error ทั้งหมด
-        print("="*50 + "\n")
-    #================================================================
-
+        traceback.print_exc()
     finally:
-        print("\nการสำรวจ DFS เสร็จสมบูรณ์")
-
-        print("กำลังบันทึกข้อมูลแผนที่และ Marker ลงไฟล์ JSON...")
-        maze_map_serializable = {str(k): list(v) for k, v in maze_map.items()}
-        markers_found_serializable = {str(k): v for k, v in markers_found.items()}
-
-        output_data = {
-            "maze_map": maze_map_serializable,
-            "markers_found": markers_found_serializable,
-            "start_node": START_CELL
-        }
-        try:
-            with open('map_data.json', 'w') as f:
-                json.dump(output_data, f, indent=4)
-            print("บันทึกไฟล์ 'map_data.json' เรียบร้อยแล้ว")
-        except Exception as e:
-            print(f"เกิดข้อผิดพลาดในการบันทึกไฟล์ JSON: {e}")
-
-        print("กำลังสร้างแผนที่สุดท้าย...")
-        plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found, "Final Maze & Marker Map")
-
-        try:
-            file_name = 'final_maze_and_marker_map.png'
-            plt.savefig(file_name, dpi=300, bbox_inches='tight')
-            print(f"บันทึกแผนที่ '{file_name}' เรียบร้อยแล้ว")
-            plt.show()
-        except Exception as e:
-            print(f"เกิดข้อผิดพลาดในการบันทึกไฟล์: {e}")
-
-        print("กำลังทำความสะอาดและปิดการเชื่อมต่อ...")
-        stop_flag = True
-        time.sleep(0.2)
+        print("\nExploration finished or stopped.")
+        stop_flag = True # <<< เพิ่มเข้ามาใหม่ เพื่อให้ Thread หยุดทำงาน
         controller.stop()
 
+        # ===================== [แก้ไข] เพิ่มส่วนนี้เข้ามา =====================
+        print("Generating final map...")
+        # 1. วาดแผนที่ครั้งสุดท้ายด้วยข้อมูลทั้งหมดที่รวบรวมมา
+        plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found, title="Final Maze Map")
+        
+        # 2. แสดงหน้าต่างแผนที่ค้างไว้
+        finalize_show() 
+        # =================================================================
+
+        # ... (ส่วนบันทึกไฟล์ JSON และ Plotting ของเดิม) ...
+        print("Saving map data to maze_map.json...")
+        try:
+            # แปลงข้อมูลให้อยู่ในรูปแบบที่ JSON จัดเก็บได้ (เช่น set -> list, tuple -> list)
+            map_data = {
+                'walls': [list(sorted(wall)) for wall in walls],
+                'markers': {str(pos): data for pos, data in markers_found.items()},
+                'visited_path': list(path_stack)
+            }
+
+            # เขียนไฟล์ JSON
+            with open('maze_map.json', 'w', encoding='utf-8') as f:
+                json.dump(map_data, f, indent=4, ensure_ascii=False)
+            
+            print("Successfully saved map to maze_map.json")
+
+        except Exception as e:
+            print(f"Error saving JSON file: {e}")
+        
         ep_sensor.unsub_distance()
         ep_chassis.unsub_attitude()
         ep_chassis.unsub_position()
-        
         ep_robot.close()
-        print("โปรแกรมจบการทำงาน")
+        print("Program terminated.")
