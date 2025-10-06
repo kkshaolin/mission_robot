@@ -255,7 +255,7 @@ ROBOT_MODE = "EXPLORE"  # โหมดเริ่มต้น: EXPLORE, DASH
 marker_sighted_flag = threading.Event() # ใช้เป็นสัญญาณว่าเจอ Marker
 DASH_SPEED_WF = 0.45 # ความเร็วสูงขึ้นสำหรับ Dash Mode
 
-SCAN_DURATION_S = 0.2
+SCAN_DURATION_S = 0.1
 TOF_WALL_THRESHOLD_CM = 50
 TOF_DASH_THRESHOLD_CM = 120.0 # ระยะ (cm) ที่จะถือว่าเป็นทางตรงยาว
 START_CELL = (0, 0)
@@ -376,7 +376,7 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
     found_this_scan = {} 
     
     try:
-        ep_camera.start_video_stream(display=False, resolution='480p')
+        ep_camera.start_video_stream(display=True, resolution='480p')
         time.sleep(0.5)
 
         # --- สร้างฟังก์ชันย่อยเพื่อลดการเขียนโค้ดซ้ำ ---
@@ -386,9 +386,9 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
                 ep_gimbal.recenter().wait_for_completed()
             else:
                 # <<< [แก้ไข] สั่งให้หมุน (yaw) ไปยังมุมที่ต้องการ พร้อมกับก้ม (pitch) ลง 20 องศา
-                ep_gimbal.move(yaw=angle, pitch=-20, yaw_speed=180).wait_for_completed()
+                ep_gimbal.move(yaw=angle, pitch=-20, yaw_speed=240).wait_for_completed()
             
-            time.sleep(1.0)
+            time.sleep(0.7)
             frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
             if frame is None: return
 
