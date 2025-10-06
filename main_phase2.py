@@ -43,6 +43,59 @@ class Control:
         self.ep_chassis.move(x=0, y=0, z=-angle_deg, z_speed=45).wait_for_completed()
         time.sleep(0.5)
 
+    def move_forward_pid(self, cell_size_m, Kp=3, Ki=0.0001, Kd=0.001, v_clip=0.4, tol_m=0.02):
+        """
+        [ฟังก์ชันที่เพิ่มเข้ามา] เดินหน้าตรงเป็นระยะทางที่กำหนดโดยใช้ PID
+        """
+        global current_x, current_y
+        print(f"Action: Moving forward {cell_size_m:.2f} m using PID")
+        pid = PIDController(Kp=Kp, Ki=Ki, Kd=Kd, setpoint=cell_size_m)
+        sx, sy = current_x, current_y
+        t0 = time.time()
+        max_duration_s = 15
+        while time.time() - t0 < max_duration_s:
+            dist = math.hypot(current_x - sx, current_y - sy)
+            speed = float(np.clip(pid.compute(dist), -v_clip, v_clip))
+            self.ep_chassis.drive_speed(x=speed, y=0, z=0, timeout=0.1)
+            if abs(cell_size_m - dist) < tol_m:
+                print("Movement complete.")
+                self.stop()
+                return
+            time.sleep(0.02)
+        print("[WARNING] move_forward_pid timed out. Stopping robot.")
+        self.stop()
+
+    def align_with_left_wall(self, duration_s=2.0):
+        """
+        [ฟังก์ชันที่เพิ่มเข้ามา] จัดตำแหน่งหุ่นยนต์ให้ขนานกับกำแพงด้านซ้าย โดยไม่เคลื่อนที่ไปข้างหน้า
+        """
+        print("Action: Aligning with left wall...")
+        
+        pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
+
+        start_time = time.time()
+        while time.time() - start_time < duration_s:
+            ir_front = ir_left_cm 
+            ir_rear = ir_right_cm
+            
+            angle_error = ir_front - ir_rear
+            current_dist_avg = (ir_front + ir_rear) / 2.0
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
+
+            z_speed = pid_angle.compute(angle_error)
+            y_speed = pid_dist.compute(dist_error)
+            
+            z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
+            y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
+            
+            # สั่งเคลื่อนที่เฉพาะแกน y (ด้านข้าง) และ z (หมุน) โดย x = 0
+            self.ep_chassis.drive_speed(x=0, y=y_speed, z=z_speed, timeout=0.1)
+            time.sleep(0.02)
+        
+        print("Alignment complete.")
+        self.stop()
+
     # ===================== [ฟังก์ชันใหม่ - ปรับแก้สำหรับเซนเซอร์ซ้าย] =====================
     def follow_wall_to_next_node(self, cell_size_m):
         """
@@ -286,8 +339,10 @@ def follow_path_optimized(controller, path, initial_heading):
             controller.turn(turn_angle)
         robot_current_heading = normalize_angle(initial_target_heading)
 
-        # 5. สั่งเดินยาวรวดเดียวด้วย Wall Following
-        controller.follow_wall_to_next_node(total_distance)
+        # --- [ส่วนที่แก้ไขหลัก] ---
+        # 5. จัดตำแหน่งให้ขนานกับกำแพงก่อน แล้วค่อยเดินหน้าตรง
+        controller.align_with_left_wall()
+        controller.move_forward_pid(total_distance)
         
         # 6. อัปเดตตำแหน่งใน path ไปยังจุดสุดท้ายของทางตรง
         path_index += straight_steps

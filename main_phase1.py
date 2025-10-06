@@ -178,6 +178,41 @@ class Control:
         
         self.stop()
         return "STOPPED"
+    
+    def align_with_left_wall(self, duration_s=2.0):
+        """
+        [ฟังก์ชันใหม่] จัดตำแหน่งหุ่นยนต์ให้ขนานกับกำแพงด้านซ้าย โดยไม่เคลื่อนที่ไปข้างหน้า
+        จะทำงานเป็นเวลาสั้นๆ เพื่อปรับมุมและระยะห่างให้คงที่
+        """
+        print("Action: Aligning with left wall...")
+        
+        # ใช้ PID Gains ชุดเดียวกับ follow_wall_to_next_node
+        pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
+
+        start_time = time.time()
+        while time.time() - start_time < duration_s:
+            ir_front = ir_left_cm 
+            ir_rear = ir_right_cm
+            
+            # คำนวณ Error เหมือนเดิม
+            angle_error = ir_front - ir_rear
+            current_dist_avg = (ir_front + ir_rear) / 2.0
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
+
+            # คำนวณ Speed เหมือนเดิม
+            z_speed = pid_angle.compute(angle_error)
+            y_speed = pid_dist.compute(dist_error)
+            
+            z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
+            y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
+            
+            # [สำคัญ] สั่งเคลื่อนที่เฉพาะแกน y (ด้านข้าง) และ z (หมุน) โดย x = 0
+            self.ep_chassis.drive_speed(x=0, y=y_speed, z=z_speed, timeout=0.1)
+            time.sleep(0.02)
+        
+        print("Alignment complete.")
+        self.stop() # หยุดให้สนิทหลังจัดตำแหน่งเสร็จ
 
 # ===================== Global State & Constants [แก้ไข] =====================
 stop_flag = False
@@ -614,8 +649,13 @@ def turn_and_move(controller, target_heading):
     if abs(turn_angle) > 2.0:
         controller.turn(turn_angle)
     current_heading_degrees = normalize_angle(target_heading)
-    # [เปลี่ยน] เรียกใช้ฟังก์ชันใหม่ที่ไม่มี follow_side
-    controller.follow_wall_to_next_node(NODE_DISTANCE)
+
+    # --- [ส่วนที่แก้ไขหลัก] ---
+    # 1. เรียกใช้ฟังก์ชันจัดตำแหน่งให้ขนานกับกำแพงก่อน
+    controller.align_with_left_wall()
+    
+    # 2. หลังจากจัดตำแหน่งแล้ว ค่อยสั่งเดินหน้าตรงๆ ด้วย PID
+    controller.move_forward_pid(NODE_DISTANCE)
 
 def map_current_cell():
     global maze_map, walls, current_pos, current_heading_degrees
