@@ -8,6 +8,11 @@ import numpy as np
 import cv2
 import json
 
+START_CELL = (0, 2)             # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
+MAP_MIN_BOUNDS = (0, 0)         # พิกัดซ้าย-ล่างสุดของแผนที่
+MAP_MAX_BOUNDS = (5, 5)         # พิกัดขวา-บนสุดของแผนที่
+NODE_DISTANCE = 0.6             # ระยะห่างระหว่าง Node (เมตร)
+
 # ===================== PID Controller Class (คงเดิม) =====================
 class PIDController:
     def __init__(self, Kp, Ki, Kd, setpoint):
@@ -186,11 +191,10 @@ last_value_left = 0
 last_value_right = 0
 
 # ตาราง Calibrate (ตัวอย่าง - ควรใช้ค่าที่ได้จากการทดลองจริงของคุณ)
-CALIBRA_TABLE_IR_FRONT = {249: 10, 216: 15, 139: 20, 117: 25}
+CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
+CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
 
-CALIBRA_TABLE_IR_REAR = {536: 10, 471: 15, 333: 20, 299: 25}
-
-TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างที่ต้องการจากกำแพง
+TARGET_WALL_DISTANCE_CM = 8.5  # ระยะห่างที่ต้องการจากกำแพง
 BASE_FORWARD_SPEED_WF = 0.25    # ความเร็วเดินหน้าพื้นฐานตอนตามกำแพง
 MAX_Y_SPEED = 0.3               # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง
 MAX_Z_SPEED = 32.0              # ความเร็วสูงสุดในการหมุนตัว
@@ -628,27 +632,19 @@ def map_current_cell():
 def find_and_move_to_next_cell(controller, ep_camera, ep_gimbal):
     global visited_nodes, current_pos, current_heading_degrees
 
-    # --- ตรรกะการตัดสินใจเข้า Dash Mode (แบบปกติ) ---
-    target_heading_front = normalize_angle(current_heading_degrees)
-    if target_heading_front in maze_map.get(current_pos, set()):
-        target_cell_front = get_target_coordinates(current_pos, target_heading_front)
-        if target_cell_front not in visited_nodes:
-            # ถ้าเงื่อนไขปกติผ่าน ให้เรียกฟังก์ชัน Dash
-            _execute_dash_and_update_map(controller, ep_camera, ep_gimbal)
-            return True # บอก main loop ว่ามีการเคลื่อนที่แล้ว
-
-    # --- ตรรกะเดิม: ถ้า Dash ไม่ได้ ให้หาทางเลี้ยว (Explore Mode) ---
-    for angle in [-90, 90]: # หาทางซ้าย-ขวา
+    # <<< [ส่วนที่แก้ไข] ลบการเรียก Dash ออกไป ให้เคลื่อนที่ทีละช่องเท่านั้น >>>
+    # จัดลำดับความสำคัญให้ไปข้างหน้าก่อน ถ้าทำได้
+    for angle in [0, -90, 90]: # เช็ค หน้า -> ซ้าย -> ขวา
         target_heading = normalize_angle(current_heading_degrees + angle)
         if target_heading in maze_map.get(current_pos, set()):
             target_cell = get_target_coordinates(current_pos, target_heading)
             if target_cell not in visited_nodes:
-                print(f"Found unvisited neighbor at {target_cell}, moving...")
+                print(f"Found unvisited neighbor at {target_cell}, moving one node...")
                 turn_and_move(controller, target_heading)
                 visited_nodes.add(target_cell)
                 path_stack.append(target_cell)
                 current_pos = target_cell
-                return True
+                return True # บอก main loop ว่ามีการเคลื่อนที่แล้ว
     return False
 
 def _execute_dash_and_update_map(controller, ep_camera, ep_gimbal):
@@ -762,12 +758,15 @@ if __name__ == '__main__':
             can_dash_forward = normalize_angle(current_heading_degrees) in maze_map.get(current_pos, set())
             next_cell_is_unvisited = get_target_coordinates(current_pos, current_heading_degrees) not in visited_nodes
 
-            if can_dash_forward and next_cell_is_unvisited and tof_distance_cm > TOF_DASH_THRESHOLD_CM:
-                print(f"\n[!] Long corridor detected (ToF: {tof_distance_cm:.1f} cm). Proactively entering DASH mode.")
-                _execute_dash_and_update_map(controller, ep_camera, ep_gimbal)
-                continue
+            # <<< [ส่วนที่แก้ไข] เพิ่มเงื่อนไขบังคับว่าต้องมีกำแพงสองข้าง >>>
+            is_in_corridor = (ir_left_digital == 1 and ir_right_digital == 1)
 
-            # 2. ถ้า Dash ด้วย ToF ไม่ได้ ให้ใช้ตรรกะการหาเส้นทางปกติ
+            if can_dash_forward and next_cell_is_unvisited and tof_distance_cm > TOF_DASH_THRESHOLD_CM and is_in_corridor:
+                print(f"\n[!] Perfect corridor detected (ToF: {tof_distance_cm:.1f} cm, Walls L/R). Entering DASH mode.")
+                _execute_dash_and_update_map(controller, ep_camera, ep_gimbal)
+                continue # ข้ามไปรอบถัดไปเลย
+
+            # 2. ถ้า Dash ไม่ได้ ให้ใช้ตรรกะการหาเส้นทางปกติ (ซึ่งจะไม่มีการ Dash แล้ว)
             elif find_and_move_to_next_cell(controller, ep_camera, ep_gimbal):
                 continue
             
