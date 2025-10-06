@@ -55,7 +55,7 @@ class Control:
         # === [สำคัญ] สร้าง PID controllers โดยใช้ค่า GAINS ที่ดีบักมา ===
         # หมายเหตุ: ค่า Gains เหล่านี้มาจากไฟล์ debug_wall_align.py ของคุณ
         pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
-        pid_dist = PIDController(Kp=0.01, Ki=0.0, Kd=0.002, setpoint=TARGET_WALL_DISTANCE_CM)
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
 
         sx, sy = current_x, current_y
         t0 = time.time()
@@ -75,7 +75,7 @@ class Control:
             angle_error = ir_front - ir_rear # Error สำหรับการปรับมุม
             
             current_dist_avg = (ir_front + ir_rear) / 2.0
-            dist_error = TARGET_WALL_DISTANCE_CM - current_dist_avg # Error สำหรับการปรับระยะห่าง
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM # Error สำหรับการปรับระยะห่าง
             # หมายเหตุ: สูตร dist_error นี้ถูกต้องสำหรับแกน y ของหุ่น (ค่าลบ -> เลื่อนซ้าย)
 
             # 4. คำนวณค่าการปรับแก้จาก PID
@@ -114,11 +114,11 @@ ir_right_cm = 999.0
 last_value_left = 0
 last_value_right = 0
 
-CALIBRA_TABLE_IR_FRONT = {249: 10, 216: 15, 139: 20, 117: 25}
-CALIBRA_TABLE_IR_REAR = {536: 10, 471: 15, 333: 20, 299: 25}
+CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
+CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
 
-TARGET_WALL_DISTANCE_CM = 8.0
-BASE_FORWARD_SPEED_WF = 0.3  # อาจต้องปรับความเร็วให้เหมาะกับเฟส 2
+TARGET_WALL_DISTANCE_CM = 8.5
+BASE_FORWARD_SPEED_WF = 0.25  # อาจต้องปรับความเร็วให้เหมาะกับเฟส 2
 MAX_Y_SPEED = 0.3
 MAX_Z_SPEED = 32.0
 NODE_DISTANCE = 0.6
