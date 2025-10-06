@@ -80,7 +80,7 @@ class Control:
         # === [สำคัญ] สร้าง PID controllers โดยใช้ค่า GAINS ที่ดีบักมา ===
         # หมายเหตุ: ค่า Gains เหล่านี้มาจากไฟล์ debug_wall_align.py ของคุณ
         pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
-        pid_dist = PIDController(Kp=0.01, Ki=0.0, Kd=0.002, setpoint=TARGET_WALL_DISTANCE_CM)
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
 
         sx, sy = current_x, current_y
         t0 = time.time()
@@ -95,7 +95,7 @@ class Control:
             angle_error = ir_front - ir_rear # Error สำหรับการปรับมุม
             
             current_dist_avg = (ir_front + ir_rear) / 2.0
-            dist_error = TARGET_WALL_DISTANCE_CM - current_dist_avg # Error สำหรับการปรับระยะห่าง
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM # Error สำหรับการปรับระยะห่าง
             # หมายเหตุ: สูตร dist_error นี้ถูกต้องสำหรับแกน y ของหุ่น (ค่าลบ -> เลื่อนซ้าย)
 
             # 3. คำนวณค่าการปรับแก้จาก PID
@@ -131,7 +131,7 @@ class Control:
         print("Action (Dash): Starting high-speed forward movement.")
         # ใช้ค่า PID ที่ตอบสนองเร็วขึ้นสำหรับความเร็วสูง
         pid_angle = PIDController(Kp=18.0, Ki=0.0001, Kd=0.0005, setpoint=0)
-        pid_dist = PIDController(Kp=0.015, Ki=0.0, Kd=0.002, setpoint=TARGET_WALL_DISTANCE_CM)
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
         sx, sy = current_x, current_y
         
         marker_sighted_flag.clear() # รีเซ็ตสัญญาณ Marker ก่อนเริ่มวิ่ง
@@ -163,9 +163,14 @@ class Control:
                  return "DEAD_END"
 
             # --- การควบคุมการเคลื่อนที่ (ถ้าไม่เจออะไร) ---
+            # --- การควบคุมการเคลื่อนที่ (ถ้าไม่เจออะไร) ---
             ir_front, ir_rear = ir_left_cm, ir_right_cm
             angle_error = ir_front - ir_rear
-            dist_error = TARGET_WALL_DISTANCE_CM - ((ir_front + ir_rear) / 2.0)
+            
+            # [แก้ไข] เปลี่ยนสูตรให้ตรงกับ debug_wall_align.py
+            current_dist_avg = (ir_front + ir_rear) / 2.0
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
+
             z_speed = np.clip(pid_angle.compute(angle_error), -MAX_Z_SPEED, MAX_Z_SPEED)
             y_speed = np.clip(pid_dist.compute(dist_error), -MAX_Y_SPEED, MAX_Y_SPEED)
             self.ep_chassis.drive_speed(x=DASH_SPEED_WF, y=y_speed, z=z_speed, timeout=0.1)
