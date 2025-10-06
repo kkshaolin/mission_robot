@@ -8,10 +8,19 @@ import numpy as np
 import cv2
 import json
 
-START_CELL = (0, 0)             # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
+START_CELL = (0, 3)             # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
 MAP_MIN_BOUNDS = (0, 0)         # พิกัดซ้าย-ล่างสุดของแผนที่
 MAP_MAX_BOUNDS = (3, 3)         # พิกัดขวา-บนสุดของแผนที่
 NODE_DISTANCE = 0.6             # ระยะห่างระหว่าง Node (เมตร)
+
+# ตาราง Calibrate (ตัวอย่าง - ควรใช้ค่าที่ได้จากการทดลองจริงของคุณ)
+CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
+CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
+
+TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างที่ต้องการจากกำแพง
+BASE_FORWARD_SPEED_WF = 0.25    # ความเร็วเดินหน้าพื้นฐานตอนตามกำแพง
+MAX_Y_SPEED = 0.3               # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง
+MAX_Z_SPEED = 32.0              # ความเร็วสูงสุดในการหมุนตัว
 
 # ===================== PID Controller Class (คงเดิม) =====================
 class PIDController:
@@ -69,16 +78,14 @@ class Control:
         print("[WARNING] move_forward_pid timed out. Stopping robot.")
         self.stop()
     # ===================== [ฟังก์ชันใหม่ - ปรับแก้สำหรับเซนเซอร์ซ้าย] =====================
-    def follow_wall_to_next_node(self, cell_size_m):
+    def follow_wall_to_next_node(self, cell_size_m, speed=BASE_FORWARD_SPEED_WF): # <<< [แก้ไข] เพิ่มพารามิเตอร์ speed
         """
         เคลื่อนที่ตามกำแพง "ด้านซ้าย" ไปยัง Node ถัดไปโดยใช้ PID 2 ตัว (เวอร์ชันสมบูรณ์)
         """
         global current_x, current_y, ir_left_cm, ir_right_cm 
         
-        print(f"Action: Following LEFT wall for {cell_size_m} m")
+        print(f"Action: Following LEFT wall for {cell_size_m:.2f} m at speed {speed:.2f} m/s")
 
-        # === [สำคัญ] สร้าง PID controllers โดยใช้ค่า GAINS ที่ดีบักมา ===
-        # หมายเหตุ: ค่า Gains เหล่านี้มาจากไฟล์ debug_wall_align.py ของคุณ
         pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
         pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
 
@@ -87,29 +94,22 @@ class Control:
         max_duration_s = 15
 
         while time.time() - t0 < max_duration_s:
-            # 1. อ่านค่าเซนเซอร์ล่าสุดจากตัวแปร global
-            ir_front = ir_left_cm 
-            ir_rear = ir_right_cm
+            ir_front, ir_rear = ir_left_cm, ir_right_cm
             
-            # 2. คำนวณ Error (ตรรกะเดียวกับในไฟล์ดีบัก)
-            angle_error = ir_front - ir_rear # Error สำหรับการปรับมุม
-            
+            angle_error = ir_front - ir_rear
             current_dist_avg = (ir_front + ir_rear) / 2.0
-            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM # Error สำหรับการปรับระยะห่าง
-            # หมายเหตุ: สูตร dist_error นี้ถูกต้องสำหรับแกน y ของหุ่น (ค่าลบ -> เลื่อนซ้าย)
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
 
-            # 3. คำนวณค่าการปรับแก้จาก PID
             z_speed = pid_angle.compute(angle_error)
             y_speed = pid_dist.compute(dist_error)
 
-            # 4. จำกัดค่า Output
             z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
             y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
             
             # 5. สั่งการ Chassis
-            self.ep_chassis.drive_speed(x=BASE_FORWARD_SPEED_WF, y=y_speed, z=z_speed, timeout=0.1)
+            # <<< [แก้ไข] ใช้ตัวแปร speed ที่รับเข้ามาแทนค่าคงที่
+            self.ep_chassis.drive_speed(x=speed, y=y_speed, z=z_speed, timeout=0.1)
 
-            # 6. ตรวจสอบเงื่อนไขการหยุด
             dist_traveled = math.hypot(current_x - sx, current_y - sy)
             if dist_traveled >= cell_size_m:
                 print("Movement complete.")
@@ -129,12 +129,11 @@ class Control:
         global current_x, current_y, ir_left_digital, ir_right_digital, marker_sighted_flag, tof_distance_cm
 
         print("Action (Dash): Starting high-speed forward movement.")
-        # ใช้ค่า PID ที่ตอบสนองเร็วขึ้นสำหรับความเร็วสูง
         pid_angle = PIDController(Kp=18.0, Ki=0.0001, Kd=0.0005, setpoint=0)
         pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
         sx, sy = current_x, current_y
         
-        marker_sighted_flag.clear() # รีเซ็ตสัญญาณ Marker ก่อนเริ่มวิ่ง
+        marker_sighted_flag.clear()
 
         while not stop_flag:
             dist_traveled = math.hypot(current_x - sx, current_y - sy)
@@ -145,29 +144,29 @@ class Control:
                 print(f"\n[!] Junction detected at {dist_traveled:.2f} m. Stopping.")
                 target_dist = math.ceil(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
                 if target_dist - dist_traveled < 0.1 and target_dist > 0: target_dist += NODE_DISTANCE
-                self.follow_wall_to_next_node(target_dist - dist_traveled) # เดินส่วนที่เหลือให้ถึงโหนด
+                self.follow_wall_to_next_node(target_dist - dist_traveled) 
                 return "JUNCTION"
 
             # 2. หยุดเมื่อ Marker Spotter ส่งสัญญาณมา
             if marker_sighted_flag.is_set():
                 print(f"\n[!] Marker sighted at {dist_traveled:.2f} m. Stopping.")
                 target_dist = round(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
-                self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15) # เดินช้าๆ ให้ถึงโหนด
+                # <<< การเรียกใช้นี้จะถูกต้องแล้ว
+                self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15) 
                 return "MARKER_SIGHTED"
 
             # 3. หยุดเมื่อเจอทางตัน (ToF)
             if tof_distance_cm < TOF_WALL_THRESHOLD_CM:
-                 print(f"\n[!] Dead end detected at {dist_traveled:.2f} m. Stopping.")
-                 target_dist = round(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
-                 self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15)
-                 return "DEAD_END"
+                print(f"\n[!] Dead end detected at {dist_traveled:.2f} m. Stopping.")
+                target_dist = round(dist_traveled / NODE_DISTANCE) * NODE_DISTANCE
+                # <<< การเรียกใช้นี้จะถูกต้องแล้ว
+                self.follow_wall_to_next_node(target_dist - dist_traveled, speed=0.15)
+                return "DEAD_END"
 
-            # --- การควบคุมการเคลื่อนที่ (ถ้าไม่เจออะไร) ---
             # --- การควบคุมการเคลื่อนที่ (ถ้าไม่เจออะไร) ---
             ir_front, ir_rear = ir_left_cm, ir_right_cm
             angle_error = ir_front - ir_rear
             
-            # [แก้ไข] เปลี่ยนสูตรให้ตรงกับ debug_wall_align.py
             current_dist_avg = (ir_front + ir_rear) / 2.0
             dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
 
@@ -386,7 +385,7 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
                 ep_gimbal.recenter().wait_for_completed()
             else:
                 # <<< [แก้ไข] สั่งให้หมุน (yaw) ไปยังมุมที่ต้องการ พร้อมกับก้ม (pitch) ลง 20 องศา
-                ep_gimbal.move(yaw=angle, pitch=-20, yaw_speed=240).wait_for_completed()
+                ep_gimbal.move(yaw=angle, pitch=-12, yaw_speed=240).wait_for_completed()
             
             time.sleep(0.7)
             frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
@@ -701,7 +700,7 @@ def _execute_dash_and_update_map(controller, ep_camera, ep_gimbal):
     global ROBOT_MODE, current_pos, visited_nodes, path_stack, current_heading_degrees, current_x, current_y
     
     ROBOT_MODE = "DASH"
-    ep_camera.start_video_stream(display=False, resolution='480p')
+    ep_camera.start_video_stream(display=True, resolution='480p')
     ep_gimbal.recenter().wait_for_completed()
     time.sleep(0.5)
 
