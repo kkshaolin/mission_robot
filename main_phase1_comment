@@ -1,0 +1,1069 @@
+# ==============================================================================
+# โปรแกรมควบคุมหุ่นยนต์สำรวจเขาวงกต (Maze Exploration with DFS)
+# ==============================================================================
+# หลักการทำงาน:
+# 1. ใช้ DFS (Depth-First Search) ในการสำรวจเขาวงกต
+# 2. ตรวจจับกำแพงด้วย ToF และ IR Sensor
+# 3. ตรวจจับ Marker สี/รูปทรงด้วยกล้อง
+# 4. สร้างแผนที่เขาวงกตแบบ Real-time
+# ==============================================================================
+
+from robomaster import robot  # นำเข้าไลบรารี่ควบคุมหุ่นยนต์ RoboMaster
+import msvcrt  # สำหรับตรวจจับการกดแป้นพิมพ์ (Windows)
+import time  # จัดการเวลา
+import math  # คำนวณทางคณิตศาสตร์
+import threading  # สร้าง Thread สำหรับอ่านเซ็นเซอร์พร้อมกัน
+import matplotlib.pyplot as plt  # วาดกราฟแผนที่
+import numpy as np  # คำนวณเชิงตัวเลข
+import cv2  # ประมวลผลภาพ (OpenCV)
+import json  # บันทึกข้อมูลแผนที่เป็นไฟล์ JSON
+
+# ==============================================================================
+# การตั้งค่าพื้นฐาน (Configuration)
+# ==============================================================================
+
+START_CELL = (0, 2)  # ตำแหน่งเริ่มต้นของหุ่นยนต์ในระบบพิกัดแผนที่ (x, y)
+MAP_MIN_BOUNDS = (0, 0)  # มุมซ้าย-ล่างสุดของแผนที่
+MAP_MAX_BOUNDS = (5, 5)  # มุมขวา-บนสุดของแผนที่
+NODE_DISTANCE = 0.6  # ระยะห่างระหว่างจุดโหนด (เมตร) - ใช้ในการเคลื่อนที่
+
+# ==============================================================================
+# ตาราง Calibration สำหรับ IR Sensor (อินฟราเรด)
+# ==============================================================================
+# แปลงค่า ADC ที่อ่านได้จาก IR เป็นระยะทาง (ซม.)
+
+# IR ด้านหน้า: ค่า ADC -> ระยะทาง (cm)
+CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
+
+# IR ด้านหลัง: ค่า ADC -> ระยะทาง (cm)
+CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
+
+# ==============================================================================
+# ค่าคงที่สำหรับการควบคุมการเคลื่อนที่
+# ==============================================================================
+
+TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างเป้าหมายจากกำแพงด้านข้าง (ซม.)
+BASE_FORWARD_SPEED_WF = 0.25  # ความเร็วพื้นฐานเมื่อตามกำแพง (m/s)
+MAX_Y_SPEED = 0.3  # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง (m/s)
+MAX_Z_SPEED = 32.0  # ความเร็วสูงสุดในการหมุนตัว (degree/s)
+SCAN_DURATION_S = 0.1  # ระยะเวลาในการสแกนสิ่งแวดล้อม (วินาที)
+TOF_WALL_THRESHOLD_CM = 50  # เกณฑ์ระยะห่าง ToF ที่ถือว่าไม่มีกำแพง (ซม.)
+
+# ==============================================================================
+# คลาส PIDController: ควบคุมการเคลื่อนที่แบบ PID
+# ==============================================================================
+# PID = Proportional-Integral-Derivative Controller
+# ใช้สำหรับควบคุมการเคลื่อนที่ให้ไปถึงเป้าหมายอย่างแม่นยำ
+
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, setpoint):
+        """
+        สร้าง PID Controller
+        Kp: ค่าคงที่สำหรับส่วน Proportional (ปรับตามความผิดพลาดปัจจุบัน)
+        Ki: ค่าคงที่สำหรับส่วน Integral (ปรับตามผลรวมความผิดพลาดสะสม)
+        Kd: ค่าคงที่สำหรับส่วน Derivative (ปรับตามอัตราการเปลี่ยนแปลงของความผิดพลาด)
+        setpoint: ค่าเป้าหมายที่ต้องการ
+        """
+        self.Kp, self.Ki, self.Kd = Kp, Ki, Kd  # เก็บค่า PID
+        self.setpoint = setpoint  # เป้าหมาย
+        self._prev_error, self._integral = 0.0, 0.0  # เก็บค่าความผิดพลาดครั้งก่อนและผลรวมสะสม
+        self._last_time = None  # เวลาที่คำนวณครั้งล่าสุด
+
+    def compute(self, current_value):
+        """
+        คำนวณค่า Output ของ PID จากค่าปัจจุบัน
+        current_value: ค่าที่วัดได้ในปัจจุบัน
+        return: ค่าที่ใช้ควบคุม (เช่น ความเร็ว)
+        """
+        # ถ้ายังไม่เคยคำนวณ ให้บันทึกเวลาเริ่มต้น
+        if self._last_time is None:
+            self._last_time = time.time()
+        
+        t, dt = time.time(), time.time() - self._last_time  # คำนวณเวลาที่ผ่านไป
+        if dt <= 0.001:  # ถ้าเวลาผ่านไปน้อยเกินไป ให้คืนค่า 0 (ป้องกันการหารด้วยศูนย์)
+            return 0.0
+
+        error = self.setpoint - current_value  # คำนวณความผิดพลาด (ค่าเป้าหมาย - ค่าจริง)
+        self._integral += error * dt  # สะสมความผิดพลาด (Integral)
+        derivative = (error - self._prev_error) / dt  # คำนวณอัตราการเปลี่ยนแปลง (Derivative)
+        
+        # คำนวณ Output = Kp*error + Ki*integral + Kd*derivative
+        out = (self.Kp * error) + (self.Ki * self._integral) + (self.Kd * derivative)
+        
+        self._prev_error, self._last_time = error, t  # บันทึกค่าสำหรับรอบถัดไป
+        return out
+
+# ==============================================================================
+# คลาส Control: ควบคุมการเคลื่อนที่ของหุ่นยนต์
+# ==============================================================================
+
+class Control:
+    def __init__(self, ep_chassis):
+        """
+        สร้างตัวควบคุมการเคลื่อนที่
+        ep_chassis: ออบเจ็กต์ควบคุมแชสซีของหุ่นยนต์
+        """
+        self.ep_chassis = ep_chassis
+
+    def stop(self):
+        """หยุดการเคลื่อนที่ทั้งหมด"""
+        self.ep_chassis.drive_speed(x=0, y=0, z=0, timeout=0.2)  # สั่งให้ความเร็วเป็น 0 ทุกแกน
+        time.sleep(0.2)  # รอให้หยุดจริงๆ
+
+    def turn(self, angle_deg):
+        """
+        หมุนหุ่นยนต์ตามมุมที่กำหนด
+        angle_deg: มุมที่ต้องการหมุน (องศา)
+        """
+        print(f"Action: Turning {angle_deg:.1f} degrees")
+        # ใช้คำสั่ง move โดยกำหนดแค่แกน z (การหมุน) ความเร็ว 80 องศา/วินาที
+        self.ep_chassis.move(x=0, y=0, z=-angle_deg, z_speed=80).wait_for_completed()
+        time.sleep(0.2)  # รอให้เสถียร
+
+    def move_forward_pid(self, cell_size_m, Kp=3, Ki=0.0001, Kd=0.001, v_clip=0.6, tol_m=0.02):
+        """
+        เคลื่อนที่ไปข้างหน้าระยะทางที่กำหนดโดยใช้ PID ควบคุม
+        cell_size_m: ระยะทางที่ต้องการเคลื่อนที่ (เมตร)
+        Kp, Ki, Kd: ค่าคงที่ PID
+        v_clip: ความเร็วสูงสุดที่อนุญาต (m/s)
+        tol_m: ค่าความคลาดเคลื่อนที่ยอมรับได้ (เมตร)
+        """
+        global current_x, current_y  # ใช้ตำแหน่งปัจจุบันจาก Global Variable
+        print(f"Action: Moving forward {cell_size_m} m using PID")
+        
+        # สร้าง PID Controller โดยมี setpoint เป็นระยะทางเป้าหมาย
+        pid = PIDController(Kp=Kp, Ki=Ki, Kd=Kd, setpoint=cell_size_m)
+        
+        sx, sy = current_x, current_y  # บันทึกตำแหน่งเริ่มต้น
+        t0 = time.time()  # บันทึกเวลาเริ่มต้น
+        max_duration_s = 15  # จำกัดเวลาสูงสุด 15 วินาที (ป้องกันค้าง)
+        
+        # วนลูปจนกว่าจะถึงเป้าหมายหรือหมดเวลา
+        while time.time() - t0 < max_duration_s:
+            # คำนวณระยะทางที่เคลื่อนที่ไปแล้วจากตำแหน่งเริ่มต้น
+            dist = math.hypot(current_x - sx, current_y - sy)
+            
+            # ใช้ PID คำนวณความเร็วที่เหมาะสม จำกัดด้วย v_clip
+            speed = float(np.clip(pid.compute(dist), -v_clip, v_clip))
+            
+            # สั่งให้หุ่นยนต์เคลื่อนที่ด้วยความเร็วที่คำนวณได้
+            self.ep_chassis.drive_speed(x=speed, y=0, z=0, timeout=0.1)
+            
+            # ถ้าถึงเป้าหมาย (ผิดพลาดน้อยกว่า tol_m) ให้หยุด
+            if abs(cell_size_m - dist) < tol_m:
+                print("Movement complete.")
+                self.stop()
+                return
+            
+            time.sleep(0.02)  # รอ 20ms ก่อนคำนวณรอบถัดไป
+        
+        # ถ้าหมดเวลาแล้วยังไม่ถึง ให้แสดงคำเตือนและหยุด
+        print("[WARNING] move_forward_pid timed out. Stopping robot.")
+        self.stop()
+    
+    def align_with_left_wall(self, duration_s=2.0):
+        """
+        จัดตำแหน่งหุ่นยนต์ให้ขนานกับกำแพงด้านซ้าย โดยไม่เคลื่อนที่ไปข้างหน้า
+        ใช้ IR Sensor 2 ตัว (หน้า/หลัง) วัดระยะห่างจากกำแพง
+        duration_s: ระยะเวลาที่ใช้ในการจัดตำแหน่ง (วินาที)
+        """
+        print("Action: Aligning with left wall...")
+        
+        # สร้าง PID 2 ตัว: ควบคุมมุม (ให้ขนาน) และระยะห่าง (ให้ห่างพอดี)
+        pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)  # เป้าหมาย: ความต่างระหว่าง IR หน้า-หลังเป็น 0
+        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)  # เป้าหมาย: ห่างจากกำแพง 8 ซม.
+
+        start_time = time.time()  # บันทึกเวลาเริ่มต้น
+        
+        # วนลูปจนครบเวลาที่กำหนด
+        while time.time() - start_time < duration_s:
+            # อ่านค่าจาก IR Sensor (Global Variable)
+            ir_front = ir_left_cm   # IR ด้านหน้าซ้าย
+            ir_rear = ir_right_cm   # IR ด้านหลังซ้าย
+            
+            # คำนวณความแตกต่างระหว่าง IR หน้า-หลัง (ถ้าต่างกัน = ไม่ขนาน)
+            angle_error = ir_front - ir_rear
+            
+            # คำนวณระยะห่างเฉลี่ยจากกำแพง
+            current_dist_avg = (ir_front + ir_rear) / 2.0
+            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
+
+            # ใช้ PID คำนวณความเร็วในการหมุน (z) และเคลื่อนที่ด้านข้าง (y)
+            z_speed = pid_angle.compute(angle_error)  # ควบคุมการหมุนให้ขนาน
+            y_speed = pid_dist.compute(dist_error)    # ควบคุมระยะห่าง
+            
+            # จำกัดความเร็วไม่ให้เกินขีดจำกัด
+            z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
+            y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
+            
+            # สั่งเคลื่อนที่: x=0 (ไม่เดินหน้า), y=y_speed (ซ้าย-ขวา), z=z_speed (หมุน)
+            self.ep_chassis.drive_speed(x=0, y=y_speed, z=z_speed, timeout=0.1)
+            time.sleep(0.02)  # รอ 20ms ก่อนคำนวณรอบถัดไป
+        
+        print("Alignment complete.")
+        self.stop()  # หยุดเมื่อครบเวลา
+
+# ==============================================================================
+# ตัวแปร Global: เก็บสถานะปัจจุบันของหุ่นยนต์และเซ็นเซอร์
+# ==============================================================================
+
+stop_flag = False  # Flag สำหรับหยุดโปรแกรม
+tof_distance_cm = 999.0  # ระยะห่างจาก ToF Sensor (ซม.) - เริ่มต้นเป็นค่าสูงมาก
+current_yaw = 0.0  # มุมการหมุนปัจจุบัน (องศา) จาก IMU
+current_x = 0.0  # ตำแหน่ง X ปัจจุบัน (เมตร)
+current_y = 0.0  # ตำแหน่ง Y ปัจจุบัน (เมตร)
+
+# ตัวแปรสำหรับ IR Sensor (อินฟราเรด)
+ir_left_digital = 0   # สถานะ IR ซ้าย (0 = ไม่เจอกำแพง, 1 = เจอกำแพง)
+ir_right_digital = 0  # สถานะ IR ขวา (0 = ไม่เจอกำแพง, 1 = เจอกำแพง)
+ir_left_cm = 999.0    # ระยะห่างจาก IR ซ้าย (ซม.) แบบ Analog
+ir_right_cm = 999.0   # ระยะห่างจาก IR ขวา (ซม.) แบบ Analog
+last_value_left = 0   # ค่าล่าสุดสำหรับ Lowpass Filter (ซ้าย)
+last_value_right = 0  # ค่าล่าสุดสำหรับ Lowpass Filter (ขวา)
+
+# ==============================================================================
+# ตัวแปรสำหรับ DFS (Depth-First Search) และการสร้างแผนที่
+# ==============================================================================
+
+maze_map = {}  # เก็บแผนที่เขาวงกต: {(x,y): set(ทิศทางที่เปิด)}
+visited_nodes = set()  # เก็บตำแหน่งที่เคยสำรวจแล้ว
+path_stack = []  # Stack สำหรับเก็บเส้นทาง (ใช้ใน DFS)
+walls = set()  # เก็บตำแหน่งกำแพง: set of ((x1,y1), (x2,y2))
+current_pos = (1, 1)  # ตำแหน่งปัจจุบันในแผนที่
+current_heading_degrees = 0  # ทิศทางที่หุ่นยนต์หันหน้าไป (องศา)
+markers_found = {}  # เก็บ Marker ที่ตรวจพบ: {(x,y): [list of markers]}
+
+# ==============================================================================
+# ค่าคงที่สำหรับการตรวจจับ Marker ด้วยกล้อง
+# ==============================================================================
+
+# ขนาดภาพจากกล้อง
+FRAME_WIDTH = 1400   # ความกว้างของภาพ (pixel)
+FRAME_HEIGHT = 480   # ความสูงของภาพ (pixel)
+
+# กำหนดพื้นที่ ROI (Region of Interest) - บริเวณที่ต้องการตรวจจับ
+ROI_TOP = 150  # เริ่มตรวจจับตั้งแต่ความสูง 150px ลงมา (ตัดส่วนบนออก)
+ROI_BOTTOM = FRAME_HEIGHT  # จนถึงด้านล่างสุดของภาพ
+ROI_LEFT = 0  # ตั้งแต่ซ้ายสุด
+ROI_RIGHT = FRAME_WIDTH  # จนถึงขวาสุด
+
+# กำหนดช่วงสี HSV สำหรับแต่ละสี (ใช้ตรวจจับ Marker)
+COLOR_RANGES = {
+    'red': [  # สีแดง: มี 2 ช่วง (เพราะสีแดงอยู่ที่ปลาย Hue Spectrum)
+        {'lower': np.array([0, 90, 70]), 'upper': np.array([10, 255, 255])},
+        {'lower': np.array([170, 90, 70]), 'upper': np.array([180, 255, 255])}
+    ],
+    'green': [{'lower': np.array([75, 230, 25]), 'upper': np.array([90, 255, 255])}],  # สีเขียว
+    'blue': [{'lower': np.array([100, 190, 30]), 'upper': np.array([126, 255, 255])}],  # สีน้ำเงิน
+    'yellow': [{'lower': np.array([20, 100, 100]), 'upper': np.array([35, 255, 255])}]  # สีเหลือง
+}
+
+# เงื่อนไขการกรอง Contour (วัตถุที่ตรวจพบ)
+MIN_CONTOUR_AREA = 800  # พื้นที่ขั้นต่ำของวัตถุ (pixel²)
+MAX_CONTOUR_AREA = 50000  # พื้นที่สูงสุดของวัตถุ (pixel²)
+MIN_ASPECT_RATIO = 0.2  # อัตราส่วน width/height ขั้นต่ำ
+MAX_ASPECT_RATIO = 5.0  # อัตราส่วน width/height สูงสุด
+MIN_SOLIDITY = 0.4  # ความแน่นของวัตถุ (พื้นที่/พื้นที่ Convex Hull) ขั้นต่ำ
+
+# ค่าคงที่สำหรับ Morphological Operations (ลบ Noise ในภาพ)
+MORPH_KERNEL_SIZE = (7, 7)  # ขนาด Kernel ที่ใช้ในการ Opening/Closing
+MORPH_OPEN_ITER = 2  # จำนวนครั้งของ Opening (ลบจุดเล็กๆ)
+MORPH_CLOSE_ITER = 2  # จำนวนครั้งของ Closing (เติมช่องว่างเล็กๆ)
+
+# ==============================================================================
+# สร้างกราฟสำหรับแสดงแผนที่
+# ==============================================================================
+_fig, _ax = plt.subplots(figsize=(8, 8))  # สร้าง Figure และ Axes สำหรับวาดแผนที่
+
+# ==============================================================================
+# ฟังก์ชันตรวจจับและวิเคราะห์ Marker
+# ==============================================================================
+
+def identify_shape(contour):
+    """
+    ระบุรูปทรงของวัตถุจาก Contour
+    contour: รูปร่างของวัตถุที่ตรวจพบ
+    return: ชื่อรูปทรง (string)
+    """
+    shape = 'unknown'  # ค่าเริ่มต้น
+    peri = cv2.arcLength(contour, True)  # คำนวณความยาวขอบ (Perimeter)
+    approx = cv2.approxPolyDP(contour, 0.03 * peri, True)  # ประมาณรูปทรงเป็นรูปหลายเหลี่ยม
+    area = cv2.contourArea(contour)  # คำนวณพื้นที่
+    
+    if len(approx) == 4:  # ถ้ามี 4 มุม = สี่เหลี่ยม
+        (x, y, w, h) = cv2.boundingRect(approx)  # หา Bounding Box
+        aspect_ratio = float(w) / h if h > 0 else 0  # คำนวณอัตราส่วน กว้าง/สูง
+        
+        # แยกประเภทสี่เหลี่ยม
+        if 0.95 <= aspect_ratio <= 1.05:  # อัตราส่วนใกล้ 1 = จัตุรัส
+            shape = 'square'
+        elif aspect_ratio > 1.05:  # กว้างกว่าสูง = สี่เหลี่ยมแนวนอน
+            shape = 'horizontal_rectangle'
+        else:  # สูงกว่ากว้าง = สี่เหลี่ยมแนวตั้ง
+            shape = 'vertical_rectangle'
+            
+    elif len(approx) > 4:  # มีมากกว่า 4 มุม = อาจเป็นวงกลม
+        if peri > 0:
+            # คำนวณความเป็นวงกลม (Circularity) = 4π(Area/Perimeter²)
+            circularity = 4 * np.pi * (area / (peri * peri))
+            if circularity > 0.85:  # ถ้าใกล้ 1 = วงกลม
+                shape = 'circle'
+    
+    return shape
+
+def detect_color_mask(frame, color_name):
+    """
+    สร้าง Mask สำหรับสีที่ต้องการจากภาพ
+    frame: ภาพที่ต้องการประมวลผล (BGR)
+    color_name: ชื่อสีที่ต้องการหา (string)
+    return: Binary mask (0/255)
+    """
+    m = frame.copy()  # คัดลอกภาพเพื่อไม่ให้กระทบต้นฉบับ
+    
+    # ตัดส่วนที่ไม่ต้องการออก (นอก ROI) โดยเซ็ตเป็นสีดำ
+    m[0:ROI_TOP, :] = 0  # ตัดด้านบน
+    m[ROI_BOTTOM:, :] = 0  # ตัดด้านล่าง
+    m[:, 0:ROI_LEFT] = 0  # ตัดด้านซ้าย
+    m[:, ROI_RIGHT:] = 0  # ตัดด้านขวา
+    
+    # ลด Noise ด้วย Gaussian Blur และแปลงเป็น HSV Color Space
+    hsv = cv2.cvtColor(cv2.GaussianBlur(m, (7, 7), 1), cv2.COLOR_BGR2HSV)
+    
+    # สร้าง Mask เปล่าสำหรับเก็บผลลัพธ์
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    
+    # วนลูปตามช่วงสีที่กำหนดไว้ใน COLOR_RANGES
+    for r in COLOR_RANGES[color_name]:
+        # ใช้ inRange หาพิกเซลที่อยู่ในช่วงสี แล้ว OR เข้ากับ mask เดิม
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, r['lower'], r['upper']))
+    
+    # ลบ Noise ด้วย Morphological Operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=MORPH_OPEN_ITER)  # Opening: ลบจุดเล็กๆ
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_CLOSE_ITER)  # Closing: เติมรูเล็กๆ
+    
+    # ลด Noise เพิ่มเติมด้วย Median Blur
+    return cv2.medianBlur(mask, 5)
+
+def find_largest_target(mask):
+    """
+    หาวัตถุที่ใหญ่ที่สุดและผ่านเงื่อนไขทั้งหมดใน Mask
+    mask: Binary mask ที่มีวัตถุที่ตรวจ
+return: Dictionary ที่มีข้อมูลวัตถุที่ใหญ่ที่สุด หรือ None ถ้าไม่พบ
+    """
+    # หา Contours (เส้นขอบของวัตถุ) ใน Mask
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:  # ถ้าไม่เจอ Contour ใดๆ ให้คืนค่า None
+        return None
+    
+    valid_targets = []  # เก็บวัตถุที่ผ่านเงื่อนไขทั้งหมด
+    
+    # วนลูปตรวจสอบทุก Contour
+    for cnt in contours:
+        area = cv2.contourArea(cnt)  # คำนวณพื้นที่
+        
+        # เงื่อนไข 1: พื้นที่ต้องอยู่ในช่วงที่กำหนด
+        if not (MIN_CONTOUR_AREA <= area <= MAX_CONTOUR_AREA):
+            continue
+        
+        # หา Bounding Box และจุดศูนย์กลาง
+        x, y, w, h = cv2.boundingRect(cnt)
+        center_x, center_y = x + w/2, y + h/2
+        
+        # เงื่อนไข 2: จุดศูนย์กลางต้องอยู่ใน ROI
+        if not (ROI_TOP < center_y < ROI_BOTTOM and ROI_LEFT < center_x < ROI_RIGHT):
+            continue
+        
+        # เงื่อนไข 3: อัตราส่วนกว้าง/สูง ต้องอยู่ในช่วงที่กำหนด
+        aspect = float(w)/h if h > 0 else 0
+        if not (MIN_ASPECT_RATIO <= aspect <= MAX_ASPECT_RATIO):
+            continue
+        
+        # เงื่อนไข 4: ความแน่น (Solidity) ต้องมากพอ
+        hull = cv2.convexHull(cnt)  # หา Convex Hull (รูปนูนที่ครอบวัตถุ)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / hull_area if hull_area > 0 else 0
+        if solidity < MIN_SOLIDITY:  # ถ้าน้อยเกินไป = วัตถุมีรูหรือไม่สมบูรณ์
+            continue
+        
+        # เงื่อนไข 5: ต้องระบุรูปทรงได้
+        shape = identify_shape(cnt)
+        if shape == 'unknown':
+            continue
+        
+        # ถ้าผ่านทุกเงื่อนไข ให้เก็บข้อมูลเข้า List
+        valid_targets.append({'contour': cnt, 'area': area, 'shape': shape})
+    
+    if not valid_targets:  # ถ้าไม่มีวัตถุที่ผ่านเงื่อนไข
+        return None
+    
+    # คืนวัตถุที่มีพื้นที่ใหญ่ที่สุด
+    return max(valid_targets, key=lambda x: x['area'])
+
+def detect_marker_optimized_scan(ep_camera, ep_gimbal):
+    """
+    สแกนหา Marker ในตำแหน่งปัจจุบันโดยหมุนกล้องไป 3 ทิศทาง (กลาง, ซ้าย, ขวา)
+    ep_camera: ออบเจ็กต์กล้อง
+    ep_gimbal: ออบเจ็กต์ควบคุม Gimbal (ฐานหมุนกล้อง)
+    """
+    global markers_found, current_pos
+    
+    print(f"[{current_pos}] กำลังสแกนหา Marker แบบ Multi-Detection (กลาง->ซ้าย->ขวา)...")
+    
+    # ถ้าเคยสแกนตำแหน่งนี้แล้ว ไม่ต้องสแกนซ้ำ
+    if current_pos in markers_found:
+        print(f"[{current_pos}] เคยสแกนตำแหน่งนี้แล้ว. ข้ามการสแกนซ้ำ")
+        return
+
+    found_this_scan = {}  # เก็บ Marker ที่พบในการสแกนครั้งนี้
+    
+    try:
+        # เปิดกล้องและ Video Stream
+        ep_camera.start_video_stream(display=True, resolution='480p')
+        time.sleep(0.5)  # รอให้กล้องพร้อม
+
+        def scan_and_process(side_name, angle):
+            """
+            ฟังก์ชันย่อยสำหรับสแกนทิศทางเดียว
+            side_name: ชื่อทิศทาง (center/left/right)
+            angle: มุมที่ต้องการหมุนกล้อง
+            """
+            print(f"  -> กำลังสแกนด้าน {side_name} ({angle}°)...")
+            
+            # หมุน Gimbal ไปยังมุมที่กำหนด
+            if angle == 0:  # กลาง
+                ep_gimbal.recenter().wait_for_completed()  # กลับสู่ตำแหน่งกลาง
+            else:  # ซ้าย/ขวา
+                ep_gimbal.move(yaw=angle, pitch=-3, yaw_speed=240).wait_for_completed()
+            
+            time.sleep(0.7)  # รอให้กล้องหมุนเสร็จและเสถียร
+            
+            # อ่านภาพจากกล้อง
+            frame = ep_camera.read_cv2_image(strategy="newest", timeout=2.0)
+            if frame is None:  # ถ้าอ่านภาพไม่ได้ ข้ามไป
+                return
+
+            # วนลูปตรวจจับทุกสี
+            for color in ['red', 'green', 'blue', 'yellow']:
+                mask = detect_color_mask(frame, color)  # สร้าง Mask สำหรับสีนั้น
+                target = find_largest_target(mask)  # หาวัตถุที่ใหญ่ที่สุด
+                
+                if target:  # ถ้าเจอวัตถุ
+                    target_id = f"{color}_{target['shape']}"  # สร้าง ID เฉพาะ (เช่น "red_circle")
+                    
+                    # ถ้ายังไม่เคยเจอ หรือ เจอแต่ขนาดใหญ่กว่า ให้อัพเดท
+                    if target_id not in found_this_scan or target['area'] > found_this_scan[target_id]['area']:
+                        found_this_scan[target_id] = {
+                            'color': color,
+                            'shape': target['shape'],
+                            'side': side_name,
+                            'area': target['area']
+                        }
+        
+        # สแกน 3 ทิศทาง
+        scan_and_process('center', 0)    # กลาง
+        scan_and_process('left', -90)    # ซ้าย 90 องศา
+        scan_and_process('right', 90)    # ขวา 90 องศา
+
+        # ถ้าเจอ Marker ให้บันทึกลงใน Global Dictionary
+        if found_this_scan:
+            # ลบ key 'area' ออก (ไม่จำเป็นต้องเก็บในผลลัพธ์สุดท้าย)
+            final_markers = [dict(list(v.items())[:-1]) for v in found_this_scan.values()]
+            markers_found[current_pos] = final_markers
+            
+            # แสดงผลลัพธ์
+            print(f"!!! [{current_pos}] ตรวจพบ Marker ทั้งหมด {len(final_markers)} ชิ้น:")
+            for m in final_markers:
+                print(f"    - สี {m['color'].upper()}, รูปทรง {m['shape'].upper()} (ที่ด้าน {m['side']})")
+        else:
+            print(f"[{current_pos}] ไม่พบ Marker ใดๆ จากการสแกน")
+
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดระหว่างการสแกน Marker: {e}")
+    
+    finally:
+        # คืนกล้องกลับสู่ตำแหน่งกลางและปิด Video Stream
+        ep_gimbal.recenter().wait_for_completed()
+        ep_camera.stop_video_stream()
+        print("ปิดการใช้งานกล้อง")
+
+def plot_maze(walls_to_plot, visited_to_plot, path_stack_to_plot, current_cell_to_plot, markers_to_plot, title="Maze Exploration"):
+    """
+    วาดแผนที่เขาวงกตแบบ Real-time
+    walls_to_plot: เซ็ตของกำแพง
+    visited_to_plot: เซ็ตของช่องที่เคยเยี่ยม
+    path_stack_to_plot: เส้นทางที่เดินมา
+    current_cell_to_plot: ตำแหน่งปัจจุบันของหุ่นยนต์
+    markers_to_plot: Dictionary ของ Marker ที่ตรวจพบ
+    title: หัวข้อของกราฟ
+    """
+    _ax.clear()  # ล้างกราฟเก่า
+    
+    MAZE_BOUNDS_PLOT = (0, 5, 0, 5)  # ขอบเขตของแผนที่ (x_min, x_max, y_min, y_max)
+    x_min, x_max, y_min, y_max = MAZE_BOUNDS_PLOT
+    
+    # 1. วาดช่องที่เคยเยี่ยมแล้ว (พื้นหลังสีฟ้าอ่อน)
+    for x, y in visited_to_plot:
+        _ax.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor='lightcyan', edgecolor='none', zorder=0))
+    
+    # 2. วาดกำแพง (เส้นดำหนา)
+    for wall in walls_to_plot:
+        (x1, y1), (x2, y2) = wall  # แยกพิกัดกำแพง
+        
+        if y1 == y2:  # กำแพงแนวนอน
+            x_mid = (x1 + x2) / 2.0  # หาจุดกึ่งกลาง
+            _ax.plot([x_mid, x_mid], [y1 - 0.5, y1 + 0.5], color='k', linewidth=4)
+        
+        elif x1 == x2:  # กำแพงแนวตั้ง
+            y_mid = (y1 + y2) / 2.0  # หาจุดกึ่งกลาง
+            _ax.plot([x1 - 0.5, x1 + 0.5], [y_mid, y_mid], color='k', linewidth=4)
+    
+    # 3. วาดเส้นทางที่เดินมา (เส้นน้ำเงิน)
+    if len(path_stack_to_plot) > 1:
+        path_x, path_y = zip(*path_stack_to_plot)  # แยก x, y จาก path
+        _ax.plot(path_x, path_y, 'b-o', markersize=4, zorder=1)
+    
+    # 4. กำหนดสัญลักษณ์สำหรับแต่ละรูปทรงและสี
+    marker_symbols = {
+        'circle': 'o',                    # วงกลม
+        'square': 's',                    # สี่เหลี่ยมจัตุรัส
+        'vertical_rectangle': '|',        # สี่เหลี่ยมแนวตั้ง
+        'horizontal_rectangle': '_'       # สี่เหลี่ยมแนวนอน
+    }
+    color_map = {'red': 'r', 'green': 'g', 'blue': 'b', 'yellow': 'y'}
+    
+    # 5. วาด Marker ที่ตรวจพบ
+    for pos, marker_list in markers_to_plot.items():
+        cell_x, cell_y = pos  # ตำแหน่งของช่อง
+        
+        # วนลูปวาดทุก Marker ในช่องนั้น
+        for marker_data in marker_list:
+            shape_symbol = marker_symbols.get(marker_data['shape'], '*')  # เลือกสัญลักษณ์
+            marker_color = color_map.get(marker_data['color'], 'k')      # เลือกสี
+            side = marker_data.get('side', 'center')                     # ทิศทางที่เจอ
+            
+            # ปรับตำแหน่งตามทิศทาง (ซ้าย/กลาง/ขวา)
+            x_offset = 0
+            if side == 'left':
+                x_offset = -0.25
+            elif side == 'right':
+                x_offset = 0.25
+            
+            # วาด Marker
+            _ax.plot(cell_x + x_offset, cell_y, marker=shape_symbol, color=marker_color, 
+                    markersize=12, linestyle='None', zorder=3)
+
+    # 6. วาดตำแหน่งหุ่นยนต์ปัจจุบัน (วงกลมแดง)
+    cx, cy = current_cell_to_plot
+    _ax.plot(cx, cy, 'ro', markersize=12, label='Robot', zorder=2)
+
+    # 7. ตั้งค่ากราฟ
+    _ax.set_xlim(x_min - 0.5, x_max + 0.5)  # ขอบเขตแกน X
+    _ax.set_ylim(y_min - 0.5, y_max + 0.5)  # ขอบเขตแกน Y
+    _ax.set_aspect('equal', adjustable='box')  # ให้สัดส่วนเท่ากัน
+    _ax.grid(True, which='both', color='lightgray', linestyle='-', linewidth=0.5)  # แสดง Grid
+    
+    # ตั้งค่า Ticks
+    _ax.set_xticks(np.arange(x_min - 0.5, x_max + 1.5, 1))
+    _ax.set_yticks(np.arange(y_min - 0.5, y_max + 1.5, 1))
+    _ax.set_xticklabels([])  # ซ่อน Label
+    _ax.set_yticklabels([])
+    
+    _ax.set_title(title)  # ตั้งชื่อกราฟ
+    plt.pause(0.1)  # Pause เพื่ออัพเดทกราฟ
+
+def finalize_show():
+    """แสดงกราฟสุดท้ายและรอให้ผู้ใช้ปิดหน้าต่าง"""
+    plt.ioff()  # ปิดโหมด Interactive
+    plt.show()  # แสดงกราฟและรอ
+
+# ==============================================================================
+# ฟังก์ชัน Callback สำหรับรับข้อมูลจากเซ็นเซอร์
+# ==============================================================================
+
+def sub_tof_handler(sub_info):
+    """
+    Callback สำหรับข้อมูลจาก ToF Sensor
+    sub_info: ข้อมูลที่ได้รับ [ระยะทางในหน่วย mm]
+    """
+    global tof_distance_cm
+    tof_distance_cm = sub_info[0] / 10.0  # แปลง mm เป็น cm
+
+def sub_imu_handler(attitude_info):
+    """
+    Callback สำหรับข้อมูลจาก IMU (Inertial Measurement Unit)
+    attitude_info: ข้อมูลมุม [yaw, pitch, roll]
+    """
+    global current_yaw
+    current_yaw = attitude_info[0]  # บันทึกมุม Yaw (การหมุนรอบแกนตั้ง)
+
+def sub_position_handler(position_info):
+    """
+    Callback สำหรับข้อมูลตำแหน่งของหุ่นยนต์
+    position_info: ตำแหน่ง [x, y, z]
+    """
+    global current_x, current_y
+    current_x = position_info[0]  # บันทึกตำแหน่ง X
+    current_y = position_info[1]  # บันทึกตำแหน่ง Y
+
+def single_lowpass_filter(new_value, last_value, alpha=0.6):
+    """
+    Low-pass Filter แบบง่าย สำหรับลด Noise ของสัญญาณ
+    new_value: ค่าใหม่ที่อ่านได้
+    last_value: ค่าเก่าที่เก็บไว้
+    alpha: น้ำหนักของค่าใหม่ (0-1) ยิ่งสูง ยิ่งตอบสนองเร็ว
+    return: ค่าที่ผ่านการกรองแล้ว
+    """
+    return alpha * new_value + (1 - alpha) * last_value
+
+def adc_to_cm(adc_value, calibration_table):
+    """
+    แปลงค่า ADC จาก IR Sensor เป็นระยะทาง (cm) โดยใช้ตาราง Calibration
+    adc_value: ค่า ADC ที่อ่านได้
+    calibration_table: ตารางแปลง {ADC: ระยะทาง(cm)}
+    return: ระยะทางในหน่วย cm
+    """
+    sorted_adc = sorted(calibration_table.keys())  # เรียงค่า ADC จากน้อยไปมาก
+    
+    # ถ้าค่า ADC สูงกว่าช่วงที่มี ให้คืนค่าสูงสุด
+    if adc_value >= sorted_adc[-1]:
+        return calibration_table[sorted_adc[-1]]
+    
+    # ถ้าค่า ADC ต่ำกว่าช่วงที่มี ให้คืนค่าต่ำสุด
+    if adc_value <= sorted_adc[0]:
+        return calibration_table[sorted_adc[0]]
+    
+    # หาช่วงที่ค่า ADC อยู่และทำ Linear Interpolation
+    for i in range(len(sorted_adc) - 1):
+        adc1, adc2 = sorted_adc[i], sorted_adc[i+1]
+        if adc1 <= adc_value <= adc2:
+            dist1, dist2 = calibration_table[adc1], calibration_table[adc2]
+            ratio = (adc_value - adc1) / (adc2 - adc1)  # คำนวณอัตราส่วน
+            return dist1 + ratio * (dist2 - dist1)  # Interpolate
+    
+    return 999.0  # ถ้าไม่เจอช่วงที่ตรง ให้คืนค่าสูงมาก (error)
+
+def read_analog_ir_thread(ep_sensor_adaptor):
+    """
+    Thread สำหรับอ่านค่า IR Sensor แบบ Analog แบบต่อเนื่อง
+    ep_sensor_adaptor: ออบเจ็กต์สำหรับอ่านค่าจาก Sensor Adaptor
+    """
+    global ir_left_cm, ir_right_cm, last_value_left, last_value_right
+    
+    # วนลูปจนกว่า stop_flag จะเป็น True
+    while not stop_flag:
+        try:
+            # อ่านค่า ADC จาก IR Sensor ทั้ง 2 ตัว
+            adc_front_left = ep_sensor_adaptor.get_adc(id=2, port=1)   # IR หน้าซ้าย
+            adc_rear_left = ep_sensor_adaptor.get_adc(id=2, port=2)    # IR หลังซ้าย
+            
+            # ผ่าน Lowpass Filter เพื่อลด Noise
+            filtered_front = single_lowpass_filter(adc_front_left, last_value_left)
+            filtered_rear = single_lowpass_filter(adc_rear_left, last_value_right)
+            last_value_left, last_value_right = filtered_front, filtered_rear
+            
+            # แปลง ADC เป็นระยะทาง (cm)
+            ir_left_cm = adc_to_cm(filtered_front, CALIBRA_TABLE_IR_FRONT)
+            ir_right_cm = adc_to_cm(filtered_rear, CALIBRA_TABLE_IR_REAR)
+
+            # แสดงผลค่าที่อ่านได้ (อัพเดทบรรทัดเดิม)
+            print(f"IR ADC L/R: {adc_front_left}/{adc_rear_left} -> Filtered: {filtered_front:.1f}/{filtered_rear:.1f} -> Dist (cm): {ir_left_cm:.1f}/{ir_right_cm:.1f}  ", end='\r')
+
+        except Exception as e:
+            print(f"[ERROR] in IR thread: {e}", end='\r')
+            ir_left_cm, ir_right_cm = 0, 0  # ถ้าเกิดข้อผิดพลาด ให้ตั้งค่าเป็น 0
+        
+        time.sleep(0.05)  # รอ 50ms ก่อนอ่านรอบถัดไป
+    
+def read_digital_ir_thread(ep_sensor_adaptor):
+    """
+    Thread สำหรับอ่านค่า IR Sensor แบบ Digital (มี/ไม่มี กำแพง)
+    ep_sensor_adaptor: ออบเจ็กต์สำหรับอ่านค่าจาก Sensor Adaptor
+    """
+    global ir_left_digital, ir_right_digital
+    
+    # วนลูปจนกว่า stop_flag จะเป็น True
+    while not stop_flag:
+        try:
+            # อ่านค่า Voltage จาก Digital IR (0V หรือ 5V)
+            voltage_left = ep_sensor_adaptor.get_io(id=1, port=1)   # IR ซ้าย
+            voltage_right = ep_sensor_adaptor.get_io(id=1, port=2)  # IR ขวา
+
+            # แปลง Voltage เป็นค่า Digital (0 หรือ 1)
+            # ถ้า Voltage < 0.5V = เจอกำแพง (1), มิเช่นนั้น = ไม่เจอ (0)
+            ir_left_digital = 1 if voltage_left < 0.5 else 0
+            ir_right_digital = 1 if voltage_right < 0.5 else 0
+
+        except Exception as e:
+            print(f"[ERROR] in read_digital_ir_thread: {e}")
+            ir_left_digital, ir_right_digital = 1, 1  # ถ้าเกิดข้อผิดพลาด สมมติว่าเจอกำแพงทั้งคู่
+        
+        time.sleep(0.05)  # รอ 50ms ก่อนอ่านรอบถัดไป
+
+# ==============================================================================
+# ฟังก์ชันสำหรับการเคลื่อนที่และ Logic ของ DFS
+# ==============================================================================
+
+def normalize_angle(angle):
+    """
+    ปรับมุมให้อยู่ในช่วง (-180, 180] องศา
+    angle: มุมที่ต้องการปรับ
+    return: มุมที่ปรับแล้ว
+    """
+    while angle > 180:
+        angle -= 360
+    while angle <= -180:
+        angle += 360
+    return angle
+
+def scan_environment():
+    """
+    สแกนสิ่งแวดล้อมรอบหุ่นยนต์โดยใช้เซ็นเซอร์
+    return: Dictionary {'front': bool, 'left': bool, 'right': bool} 
+            True = มีทางเปิด, False = มีกำแพง
+    """
+    global tof_distance_cm, ir_left_digital, ir_right_digital
+    
+    open_paths = {'front': False, 'left': False, 'right': False}  # เริ่มต้นทุกทางปิด
+    time.sleep(SCAN_DURATION_S)  # รอให้เซ็นเซอร์อ่านค่าเสถียร
+    
+    # ตรวจสอบทางหน้า: ใช้ ToF Sensor
+    if tof_distance_cm > TOF_WALL_THRESHOLD_CM:
+        open_paths['front'] = True
+    
+    # ตรวจสอบทางซ้าย: ใช้ IR Digital
+    if ir_left_digital == 0:  # 0 = ไม่เจอกำแพง
+        open_paths['left'] = True
+    
+    # ตรวจสอบทางขวา: ใช้ IR Digital
+    if ir_right_digital == 0:  # 0 = ไม่เจอกำแพง
+        open_paths['right'] = True
+        
+    print(f"ผลสแกน: หน้า: {tof_distance_cm:.1f} cm | ซ้าย (digital): {ir_left_digital} | ขวา (digital): {ir_right_digital}")
+    return open_paths
+
+def get_target_coordinates(from_pos, heading_deg):
+    """
+    คำนวณพิกัดของช่องถัดไปตามทิศทางที่กำหนด
+    from_pos: พิกัดปัจจุบัน (x, y)
+    heading_deg: ทิศทางที่หันหน้าไป (องศา)
+    return: พิกัดเป้าหมาย (x, y)
+    """
+    x, y = from_pos
+    heading = normalize_angle(heading_deg)  # ปรับมุมให้อยู่ในช่วงมาตรฐาน
+    
+    # แปลงมุมเป็นการเคลื่อนที่
+    if heading == 0:  # หันหน้าไปทางเหนือ
+        return (x, y + 1)
+    elif heading == 90:  # หันหน้าไปทางตะวันออก
+        return (x + 1, y)
+    elif heading == -90:  # หันหน้าไปทางตะวันตก
+        return (x - 1, y)
+    elif abs(heading) == 180:  # หันหน้าไปทางใต้
+        return (x, y - 1)
+    
+    return from_pos  # ถ้ามุมไม่ตรงกับทิศหลัก ให้คืนตำแหน่งเดิม
+
+def get_direction_to_neighbor(from_cell, to_cell):
+    """
+    คำนวณทิศทางที่ต้องหันหน้าไปเพื่อเดินจากช่องหนึ่งไปยังอีกช่องหนึ่ง
+    from_cell: ช่องต้นทาง (x, y)
+    to_cell: ช่องปลายทาง (x, y)
+    return: มุมทิศทาง (องศา)
+    """
+    dx = to_cell[0] - from_cell[0]  # ความต่างแกน X
+    dy = to_cell[1] - from_cell[1]  # ความต่างแกน Y
+    
+    # ใช้ atan2 คำนวณมุม (ในหน่วยเรเดียน)
+# แปลงเป็นองศาและปรับให้อยู่ในช่วงมาตรฐาน
+    return normalize_angle(math.degrees(math.atan2(dx, dy)))
+
+def turn_and_move(controller, target_heading):
+    """
+    หมุนหุ่นยนต์ไปยังทิศทางเป้าหมายและเคลื่อนที่ไปข้างหน้าหนึ่งโหนด
+    controller: ออบเจ็กต์ควบคุมการเคลื่อนที่
+    target_heading: ทิศทางเป้าหมาย (องศา)
+    """
+    global current_heading_degrees, ir_left_digital
+
+    # คำนวณมุมที่ต้องหมุน
+    turn_angle = normalize_angle(target_heading - current_heading_degrees)
+    
+    # ถ้ามุมที่ต้องหมุนมากกว่า 2 องศา ให้หมุน (ป้องกันการหมุนจิ๊ดๆ)
+    if abs(turn_angle) > 2.0:
+        controller.turn(turn_angle)
+    
+    # อัพเดททิศทางปัจจุบัน
+    current_heading_degrees = normalize_angle(target_heading)
+
+    # เคลื่อนที่ไปข้างหน้าหนึ่งโหนดโดยไม่ทำ Real-time Alignment
+    print("\nMoving one node forward (without real-time alignment)...")
+    controller.move_forward_pid(NODE_DISTANCE)
+
+    time.sleep(0.3)  # รอให้หุ่นยนต์หยุดเสถียร
+    
+    # --- Logic สำคัญ: ตัดสินใจว่าจะทำ Alignment หรือไม่ ---
+    # ถ้า IR ซ้ายเจอกำแพง (ir_left_digital == 1) ให้ทำการจัดตำแหน่งกับกำแพง
+    if ir_left_digital == 1:
+        print("\nStopped at node. Wall detected on the left, now aligning...")
+        controller.align_with_left_wall(duration_s=0.5)  # Align กับกำแพงซ้าย 0.5 วินาที
+    
+    # ถ้า IR ซ้ายไม่เจอกำแพง (ir_left_digital == 0) ไม่ต้อง Align
+    else:
+        print("\nStopped at node. No wall on the left to align with.")
+
+def map_current_cell():
+    """
+    สำรวจและสร้างแผนที่ของช่องปัจจุบัน
+    บันทึกทิศทางที่เปิดและกำแพงที่พบลงใน Global Variables
+    """
+    global maze_map, walls, current_pos, current_heading_degrees
+    
+    print(f"ช่อง {current_pos} ยังไม่ได้สำรวจ กำลังสแกน...")
+    
+    # สแกนสิ่งแวดล้อม
+    scan_results = scan_environment()
+    
+    open_headings = set()  # เก็บทิศทางที่เปิด (มุมสัมบูรณ์)
+    
+    # กำหนดมุมสัมพันธ์สำหรับแต่ละทิศทาง
+    relative_moves = {'left': -90, 'front': 0, 'right': 90}
+    
+    # วนลูปตรวจสอบแต่ละทิศทาง
+    for move_key, is_open in scan_results.items():
+        # คำนวณมุมสัมบูรณ์จากมุมสัมพันธ์
+        relative_angle = relative_moves[move_key]
+        absolute_heading = normalize_angle(current_heading_degrees + relative_angle)
+        
+        if is_open:  # ถ้าทางเปิด
+            open_headings.add(absolute_heading)
+        else:  # ถ้ามีกำแพง
+            # หาพิกัดช่องเพื่อนบ้านในทิศทางนั้น
+            neighbor_cell = get_target_coordinates(current_pos, absolute_heading)
+            # บันทึกกำแพง (เรียงลำดับพิกัดเพื่อไม่ให้ซ้ำ)
+            walls.add(tuple(sorted((current_pos, neighbor_cell))))
+    
+    # บันทึกแผนที่ของช่องนี้
+    maze_map[current_pos] = open_headings
+    print(f"สร้างแผนที่ช่อง {current_pos} มีทิศทางที่เปิด: {sorted(list(open_headings))}")
+
+def find_and_move_to_next_cell(controller):
+    """
+    หาช่องถัดไปที่ยังไม่เคยไปและเคลื่อนที่ไปยังช่องนั้น
+    ลำดับความสำคัญ: ซ้าย -> หน้า -> ขวา (ตามหลักการ Wall Follower ซ้าย)
+    
+    controller: ออบเจ็กต์ควบคุมการเคลื่อนที่
+    return: True ถ้าเคลื่อนที่สำเร็จ, False ถ้าไม่มีช่องใหม่ให้ไป
+    """
+    global visited_nodes, current_pos, current_heading_degrees
+
+    # เช็คทิศทางตามลำดับ: ซ้าย (-90°) -> หน้า (0°) -> ขวา (90°)
+    for angle in [-90, 0, 90]:
+        # คำนวณทิศทางเป้าหมาย
+        target_heading = normalize_angle(current_heading_degrees + angle)
+        
+        # เช็คว่าทิศทางนั้นเปิดอยู่หรือไม่
+        if target_heading in maze_map.get(current_pos, set()):
+            # คำนวณพิกัดช่องเป้าหมาย
+            target_cell = get_target_coordinates(current_pos, target_heading)
+            
+            # ถ้าช่องนั้นยังไม่เคยไป
+            if target_cell not in visited_nodes:
+                print(f"Found unvisited neighbor at {target_cell}, moving one node...")
+                
+                # หมุนและเคลื่อนที่ไปยังช่องนั้น
+                turn_and_move(controller, target_heading)
+                
+                # บันทึกว่าเคยไปช่องนั้นแล้ว
+                visited_nodes.add(target_cell)
+                path_stack.append(target_cell)
+                current_pos = target_cell
+                
+                return True  # เคลื่อนที่สำเร็จ
+    
+    return False  # ไม่มีช่องใหม่ให้ไป
+
+def backtrack(controller):
+    """
+    ย้อนรอยกลับไปยังช่องก่อนหน้าใน Path Stack (DFS Backtracking)
+    controller: ออบเจ็กต์ควบคุมการเคลื่อนที่
+    return: True ถ้าย้อนรอยสำเร็จ, False ถ้ากลับมาถึงจุดเริ่มต้นแล้ว
+    """
+    global path_stack, current_pos
+    
+    print("เจอทางตัน กำลังย้อนรอย (Backtracking)...")
+    
+    # ถ้า Stack มีเพียงจุดเดียว = กลับมาถึงจุดเริ่มต้นแล้ว
+    if len(path_stack) <= 1:
+        print("กลับมาที่จุดเริ่มต้น การสำรวจสิ้นสุด")
+        return False
+    
+    # ลบตำแหน่งปัจจุบันออกจาก Stack
+    path_stack.pop()
+    
+    # หาตำแหน่งก่อนหน้า
+    previous_cell = path_stack[-1]
+    
+    # คำนวณทิศทางที่ต้องหันไปเพื่อกลับ
+    backtrack_heading = get_direction_to_neighbor(current_pos, previous_cell)
+    print(f"กำลังย้อนรอยจาก {current_pos} ไปยัง {previous_cell}")
+    
+    # หมุนและเคลื่อนที่กลับ
+    turn_and_move(controller, backtrack_heading)
+
+    # อัพเดทตำแหน่งปัจจุบัน
+    current_pos = previous_cell
+    return True
+
+# ==============================================================================
+# โปรแกรมหลัก (Main Execution Block)
+# ==============================================================================
+
+if __name__ == '__main__':
+    # เชื่อมต่อหุ่นยนต์
+    ep_robot = robot.Robot()
+    ep_robot.initialize(conn_type="ap")  # เชื่อมต่อผ่าน Access Point Mode
+
+    # ดึงออบเจ็กต์ควบคุมส่วนต่างๆ ของหุ่นยนต์
+    ep_chassis = ep_robot.chassis  # แชสซี (ควบคุมการเคลื่อนที่)
+    ep_sensor = ep_robot.sensor  # เซ็นเซอร์ทั่วไป (ToF, IMU)
+    ep_gimbal = ep_robot.gimbal  # Gimbal (ฐานหมุนกล้อง)
+    ep_sensor_adaptor = ep_robot.sensor_adaptor  # Sensor Adaptor (IR Sensor)
+    ep_camera = ep_robot.camera  # กล้อง
+
+    # ตั้งค่าโหมดหุ่นยนต์: ให้แชสซีเป็นหลัก (ใช้พิกัดจากแชสซี)
+    ep_robot.set_robot_mode(mode=robot.CHASSIS_LEAD)
+    
+    # คืน Gimbal สู่ตำแหน่งกลาง
+    ep_gimbal.recenter().wait_for_completed()
+    
+    # สร้างออบเจ็กต์ควบคุมการเคลื่อนที่
+    controller = Control(ep_chassis)
+
+    # Subscribe ข้อมูลจากเซ็นเซอร์ต่างๆ (รับข้อมูลแบบต่อเนื่อง)
+    ep_sensor.sub_distance(freq=20, callback=sub_tof_handler)  # ToF: 20 Hz
+    ep_chassis.sub_attitude(freq=20, callback=sub_imu_handler)  # IMU: 20 Hz
+    ep_chassis.sub_position(freq=5, callback=sub_position_handler)  # ตำแหน่ง: 5 Hz
+
+    # สร้างและเริ่ม Thread สำหรับอ่าน IR Sensor
+    analog_ir_reader = threading.Thread(target=read_analog_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
+    digital_ir_reader = threading.Thread(target=read_digital_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
+    analog_ir_reader.start()  # เริ่ม Thread อ่าน IR Analog
+    digital_ir_reader.start()  # เริ่ม Thread อ่าน IR Digital
+
+    time.sleep(1)  # รอให้เซ็นเซอร์พร้อมทำงาน
+
+    # ตั้งค่าเริ่มต้นสำหรับ DFS
+    current_pos = START_CELL  # ตั้งตำแหน่งเริ่มต้น
+    visited_nodes.add(current_pos)  # บันทึกว่าเคยอยู่ที่นี่แล้ว
+    path_stack.append(current_pos)  # เพิ่มเข้า Path Stack
+    
+    print("Starting Maze Exploration (Node-by-Node)...")
+    
+    try:
+        # วนลูปสำรวจจนกว่า Path Stack จะว่าง หรือ กดปุ่ม ESC
+        while path_stack and not stop_flag:
+            # เช็คว่ามีการกดแป้นพิมพ์หรือไม่
+            if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':  # ESC key
+                print("ESC pressed, stopping...")
+                stop_flag = True
+                break
+
+            # แสดงสถานะปัจจุบัน
+            print(f"\n--- Current Position: {current_pos}, Heading: {current_heading_degrees}° ---")
+
+            # ถ้าช่องปัจจุบันยังไม่เคยสำรวจ
+            if current_pos not in maze_map:
+                # สร้างแผนที่ของช่องนี้ก่อน
+                map_current_cell()
+
+                # --- LOGIC ใหม่: ตรวจสอบว่าเป็นทางแยก/ทางตัน หรือไม่ ---
+                num_open_paths = len(maze_map[current_pos])  # นับจำนวนทางที่เปิด
+
+                # ทางเดินตรงๆ จะมี 2 ทาง (มาทางหนึ่ง ไปทางหนึ่ง)
+                # ถ้าไม่ใช่ 2 ทาง = เป็นทางแยก (>=3) หรือทางตัน (<=1)
+                if num_open_paths != 2:
+                    print(f"[{current_pos}] เป็นทางแยก/ทางตัน ({num_open_paths} paths), กำลังสแกน Marker...")
+                    detect_marker_optimized_scan(ep_camera, ep_gimbal)  # สแกน Marker
+                else:
+                    print(f"[{current_pos}] เป็นทางตรง, ข้ามการสแกน Marker.")
+
+                # (บรรทัดนี้ถูกคอมเม้นต์ไว้ - ถ้าต้องการดูแผนที่ Real-time ให้เอาออก)
+                # plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found)
+
+            # --- LOGIC การตัดสินใจ: พยายามไปช่องใหม่ หรือ ย้อนรอย ---
+            
+            # 1. พยายามหาช่องถัดไปที่ยังไม่เคยไป
+            if find_and_move_to_next_cell(controller):
+                # ถ้าเคลื่อนที่สำเร็จ ให้ข้ามไปทำงานรอบถัดไปเลย
+                continue
+            
+            # 2. ถ้าไปต่อไม่ได้ (ไม่มีช่องใหม่) ให้ย้อนรอย
+            elif not backtrack(controller):
+                # ถ้าการย้อนรอยล้มเหลว (กลับมาถึงจุดเริ่มต้น) ให้จบการทำงาน
+                break
+
+    except (KeyboardInterrupt, Exception) as e:
+        # จัดการกับข้อผิดพลาด
+        print(f"\nAn error occurred: {e}")
+        import traceback
+        traceback.print_exc()  # แสดง Traceback เพื่อ Debug
+    
+    finally:
+        # ส่วนนี้จะทำงานเสมอ ไม่ว่าจะจบด้วยวิธีใดก็ตาม
+        print("\nExploration finished or stopped.")
+        stop_flag = True  # ตั้ง Flag เพื่อหยุด Thread ทั้งหมด
+        controller.stop()  # หยุดหุ่นยนต์
+
+        # สร้างและบันทึกแผนที่สุดท้าย
+        print("Generating final map...")
+        plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found, title="Final Maze Map")
+        plt.savefig('maze_map.png', dpi=300)  # บันทึกเป็นไฟล์ภาพ
+        finalize_show()  # แสดงกราฟและรอให้ผู้ใช้ปิด
+        
+        # บันทึกข้อมูลแผนที่เป็นไฟล์ JSON
+        print("Saving map data to maze_map.json...")
+        try:
+            # เตรียมข้อมูลสำหรับบันทึก
+            map_data = {
+                'walls': [list(sorted(wall)) for wall in walls],  # รายการกำแพง
+                'markers': {str(pos): data for pos, data in markers_found.items()},  # Marker ที่พบ
+                'visited_path': list(path_stack)  # เส้นทางที่เดิน
+            }
+            
+            # เขียนลงไฟล์ JSON
+            with open('maze_map.json', 'w', encoding='utf-8') as f:
+                json.dump(map_data, f, indent=4, ensure_ascii=False)
+            
+            print("Successfully saved map to maze_map.json")
+
+        except Exception as e:
+            print(f"Error saving JSON file: {e}")
+        
+        # ยกเลิก Subscription ของเซ็นเซอร์ทั้งหมด
+        ep_sensor.unsub_distance()
+        ep_chassis.unsub_attitude()
+        ep_chassis.unsub_position()
+        
+        # ปิดการเชื่อมต่อกับหุ่นยนต์
+        ep_robot.close()
+        print("Program terminated.")
+
+# ==============================================================================
+# สรุปหลักการทำงานของโปรแกรม:
+# ==============================================================================
+# 1. เชื่อมต่อหุ่นยนต์และเริ่มอ่านข้อมูลจากเซ็นเซอร์
+# 2. ใช้ DFS (Depth-First Search) สำรวจเขาวงกต:
+#    - เริ่มจากจุดเริ่มต้น (START_CELL)
+#    - แต่ละจุด: สแกนสิ่งแวดล้อม (ToF + IR Sensor)
+#    - เลือกไปช่องถัดไปตามลำดับ: ซ้าย -> หน้า -> ขวา (Wall Follower)
+#    - ถ้าไม่มีช่องใหม่ ให้ย้อนรอย (Backtracking)
+# 3. ตรวจจับ Marker ที่ทางแยกและทางตันด้วยกล้อง:
+#    - ใช้ Computer Vision (OpenCV) หาสีและรูปทรง
+#    - หมุนกล้องไป 3 ทิศทาง (กลาง, ซ้าย, ขวา)
+# 4. สร้างแผนที่เขาวงกตแบบ Real-time:
+#    - บันทึกกำแพง, เส้นทาง, Marker
+#    - Plot ด้วย Matplotlib
+# 5. เมื่อสำรวจครบ บันทึกแผนที่เป็นไฟล์ PNG และ JSON
+# ==============================================================================
