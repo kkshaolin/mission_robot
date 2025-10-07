@@ -8,19 +8,17 @@ import numpy as np
 import cv2
 import json
 
-START_CELL = (0, 2)           # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
-MAP_MIN_BOUNDS = (0, 0)       # พิกัดซ้าย-ล่างสุดของแผนที่
-MAP_MAX_BOUNDS = (5, 5)       # พิกัดขวา-บนสุดของแผนที่
-NODE_DISTANCE = 0.6           # ระยะห่างระหว่าง Node (เมตร)
+START_CELL = (0, 2)          # ตำแหน่งเริ่มต้นของหุ่นยนต์ในแผนที่ (x, y)
+MAP_MIN_BOUNDS = (0, 0)      # พิกัดซ้าย-ล่างสุดของแผนที่
+MAP_MAX_BOUNDS = (5, 5)      # พิกัดขวา-บนสุดของแผนที่
+NODE_DISTANCE = 0.6          # ระยะห่างระหว่าง Node (เมตร)
 
-# ตาราง Calibrate
-CALIBRA_TABLE_IR_FRONT = {536: 10, 471: 15, 333: 20, 299: 25}
-CALIBRA_TABLE_IR_REAR = {249: 10, 216: 15, 139: 20, 117: 25}
+# --- (ลบ) ตาราง Calibrate สำหรับ Analog IR ---
 
-TARGET_WALL_DISTANCE_CM = 8.0  # ระยะห่างที่ต้องการจากกำแพง
-BASE_FORWARD_SPEED_WF = 0.25   # ความเร็วเดินหน้าพื้นฐานตอนตามกำแพง
-MAX_Y_SPEED = 0.3              # ความเร็วสูงสุดในการเคลื่อนที่ด้านข้าง
-MAX_Z_SPEED = 32.0             # ความเร็วสูงสุดในการหมุนตัว
+TARGET_WALL_DISTANCE_CM = 8.0  # (ไม่ถูกใช้งานแล้ว)
+BASE_FORWARD_SPEED_WF = 0.25   # (ไม่ถูกใช้งานแล้ว)
+MAX_Y_SPEED = 0.3              # (ไม่ถูกใช้งานแล้ว)
+MAX_Z_SPEED = 32.0             # (ไม่ถูกใช้งานแล้ว)
 SCAN_DURATION_S = 0.1
 TOF_WALL_THRESHOLD_CM = 50
 
@@ -80,36 +78,7 @@ class Control:
         print("[WARNING] move_forward_pid timed out. Stopping robot.")
         self.stop()
     
-    def align_with_left_wall(self, duration_s=2.0):
-        """
-        จัดตำแหน่งหุ่นยนต์ให้ขนานกับกำแพงด้านซ้าย โดยไม่เคลื่อนที่ไปข้างหน้า
-        """
-        print("Action: Aligning with left wall...")
-        
-        pid_angle = PIDController(Kp=14.0, Ki=0.0001, Kd=0.0002, setpoint=0)
-        pid_dist = PIDController(Kp=0.04, Ki=0.0001, Kd=0.0002, setpoint=TARGET_WALL_DISTANCE_CM)
-
-        start_time = time.time()
-        while time.time() - start_time < duration_s:
-            ir_front = ir_left_cm 
-            ir_rear = ir_right_cm
-            
-            angle_error = ir_front - ir_rear
-            current_dist_avg = (ir_front + ir_rear) / 2.0
-            dist_error = current_dist_avg - TARGET_WALL_DISTANCE_CM
-
-            z_speed = pid_angle.compute(angle_error)
-            y_speed = pid_dist.compute(dist_error)
-            
-            z_speed = float(np.clip(z_speed, -MAX_Z_SPEED, MAX_Z_SPEED))
-            y_speed = float(np.clip(y_speed, -MAX_Y_SPEED, MAX_Y_SPEED))
-            
-            # สั่งเคลื่อนที่เฉพาะแกน y (ด้านข้าง) และ z (หมุน) โดย x = 0
-            self.ep_chassis.drive_speed(x=0, y=y_speed, z=z_speed, timeout=0.1)
-            time.sleep(0.02)
-        
-        print("Alignment complete.")
-        self.stop()
+    # --- (ลบ) ฟังก์ชัน align_with_left_wall ทั้งหมด ---
 
 # ===================== Global State & Constants =====================
 stop_flag = False
@@ -118,13 +87,9 @@ current_yaw = 0.0
 current_x = 0.0
 current_y = 0.0
 
-# ตัวแปรสำหรับ IR
+# ตัวแปรสำหรับ Digital IR (Analog IR ถูกลบออก)
 ir_left_digital = 0   # 0 = ไม่มีกำแพง, 1 = เจอกำแพง
 ir_right_digital = 0  # 0 = ไม่มีกำแพง, 1 = เจอกำแพง
-ir_left_cm = 999.0
-ir_right_cm = 999.0
-last_value_left = 0
-last_value_right = 0
 
 # ตัวแปรสำหรับ DFS & Mapping
 maze_map = {}
@@ -136,15 +101,12 @@ current_heading_degrees = 0
 markers_found = {}
 
 # --- Marker Detection Constants ---
-# ขนาดภาพที่ได้จากกล้อง (Resolution)
 FRAME_WIDTH = 1400
 FRAME_HEIGHT = 480
-
-# กำหนดขอบเขตของพื้นที่ที่สนใจ (Region of Interest - ROI)
-ROI_TOP    = 150  # เริ่มตรวจจับตั้งแต่แนวตั้งที่ 150px ลงมา
+ROI_TOP = 150
 ROI_BOTTOM = FRAME_HEIGHT
-ROI_LEFT   = 0
-ROI_RIGHT  = FRAME_WIDTH
+ROI_LEFT = 0
+ROI_RIGHT = FRAME_WIDTH
 
 COLOR_RANGES = {
     'red': [
@@ -186,7 +148,6 @@ def identify_shape(contour):
 
 def detect_color_mask(frame, color_name):
     m = frame.copy()
-    # ใช้ตัวแปร ROI ใหม่ในการสร้าง Mask
     m[0:ROI_TOP, :] = 0
     m[ROI_BOTTOM:, :] = 0
     m[:, 0:ROI_LEFT] = 0
@@ -211,9 +172,7 @@ def find_largest_target(mask):
         x, y, w, h = cv2.boundingRect(cnt)
         center_x, center_y = x + w/2, y + h/2
         
-        # --- ↓↓↓ แก้ไขบรรทัดนี้ ↓↓↓ ---
         if not (ROI_TOP < center_y < ROI_BOTTOM and ROI_LEFT < center_x < ROI_RIGHT): continue
-        # --- ↑↑↑ แก้ไขบรรทัดนี้ ↑↑↑ ---
         
         aspect = float(w)/h if h > 0 else 0
         if not (MIN_ASPECT_RATIO <= aspect <= MAX_ASPECT_RATIO): continue
@@ -290,7 +249,7 @@ def detect_marker_optimized_scan(ep_camera, ep_gimbal):
 
 def plot_maze(walls_to_plot, visited_to_plot, path_stack_to_plot, current_cell_to_plot, markers_to_plot, title="Maze Exploration"):
     _ax.clear()
-    MAZE_BOUNDS_PLOT = (0, 5, 0, 5)                                                                                                      # ขนาดเเผนที่
+    MAZE_BOUNDS_PLOT = (0, 5, 0, 5)
     x_min, x_max, y_min, y_max = MAZE_BOUNDS_PLOT
     
     for x, y in visited_to_plot:
@@ -355,44 +314,9 @@ def sub_position_handler(position_info):
     current_x = position_info[0]
     current_y = position_info[1]
 
-def single_lowpass_filter(new_value, last_value, alpha=0.6):
-    return alpha * new_value + (1 - alpha) * last_value
-
-def adc_to_cm(adc_value, calibration_table):
-    sorted_adc = sorted(calibration_table.keys())
-    if adc_value >= sorted_adc[-1]:
-        return calibration_table[sorted_adc[-1]]
-    if adc_value <= sorted_adc[0]:
-        return calibration_table[sorted_adc[0]]
-    for i in range(len(sorted_adc) - 1):
-        adc1, adc2 = sorted_adc[i], sorted_adc[i+1]
-        if adc1 <= adc_value <= adc2:
-            dist1, dist2 = calibration_table[adc1], calibration_table[adc2]
-            ratio = (adc_value - adc1) / (adc2 - adc1)
-            return dist1 + ratio * (dist2 - dist1)
-    return 999.0
-
-def read_analog_ir_thread(ep_sensor_adaptor):
-    global ir_left_cm, ir_right_cm, last_value_left, last_value_right
-    while not stop_flag:
-        try:
-            adc_front_left = ep_sensor_adaptor.get_adc(id=2, port=1)
-            adc_rear_left = ep_sensor_adaptor.get_adc(id=2, port=2) 
-            
-            filtered_front = single_lowpass_filter(adc_front_left, last_value_left)
-            filtered_rear = single_lowpass_filter(adc_rear_left, last_value_right)
-            last_value_left, last_value_right = filtered_front, filtered_rear
-            
-            ir_left_cm = adc_to_cm(filtered_front, CALIBRA_TABLE_IR_FRONT)
-            ir_right_cm = adc_to_cm(filtered_rear, CALIBRA_TABLE_IR_REAR)
-
-            # --- เพิ่มบรรทัดนี้เพื่อแสดงผล ---
-            print(f"IR ADC L/R: {adc_front_left}/{adc_rear_left} -> Filtered: {filtered_front:.1f}/{filtered_rear:.1f} -> Dist (cm): {ir_left_cm:.1f}/{ir_right_cm:.1f}  ", end='\r')
-
-        except Exception as e:
-            print(f"[ERROR] in IR thread: {e}", end='\r')
-            ir_left_cm, ir_right_cm = 0, 0
-        time.sleep(0.05)
+# --- (ลบ) ฟังก์ชัน single_lowpass_filter ---
+# --- (ลบ) ฟังก์ชัน adc_to_cm ---
+# --- (ลบ) ฟังก์ชัน read_analog_ir_thread ---
     
 def read_digital_ir_thread(ep_sensor_adaptor):
     global ir_left_digital, ir_right_digital
@@ -442,28 +366,20 @@ def get_direction_to_neighbor(from_cell, to_cell):
     return normalize_angle(math.degrees(math.atan2(dx, dy)))
 
 def turn_and_move(controller, target_heading):
-    global current_heading_degrees, ir_left_digital
+    global current_heading_degrees
 
     turn_angle = normalize_angle(target_heading - current_heading_degrees)
     if abs(turn_angle) > 2.0:
         controller.turn(turn_angle)
     current_heading_degrees = normalize_angle(target_heading)
 
-    print("\nMoving one node forward (without real-time alignment)...") # เพิ่ม \n เพื่อขึ้นบรรทัดใหม่
+    print("\nMoving one node forward...") 
     controller.move_forward_pid(NODE_DISTANCE)
 
     time.sleep(0.3) 
     
-    # --- ตรรกะสำคัญ ---
-    # ถ้า ir_left_digital เป็น 1 (เจอกำแพง)
-    if ir_left_digital == 1:
-        print("\nStopped at node. Wall detected on the left, now aligning...") # เพิ่ม \n
-        controller.align_with_left_wall(duration_s=0.5)
-    
-    # ถ้า ir_left_digital เป็น 0 (ไม่เจอกำแพง)
-    else:
-        # จะไม่ทำ align_with_left_wall และทำงานต่อไปเลย
-        print("\nStopped at node. No wall on the left to align with.") # เพิ่ม \n
+    # --- (ลบ) ตรรกะการเรียก align_with_left_wall ออกไป ---
+    print("\nStopped at node.")
 
 def map_current_cell():
     global maze_map, walls, current_pos, current_heading_degrees
@@ -485,7 +401,7 @@ def map_current_cell():
 def find_and_move_to_next_cell(controller):
     global visited_nodes, current_pos, current_heading_degrees
 
-    for angle in [-90, 0, 90]: # เช็ค หน้า -> ซ้าย -> ขวา
+    for angle in [-90, 0, 90]: 
         target_heading = normalize_angle(current_heading_degrees + angle)
         if target_heading in maze_map.get(current_pos, set()):
             target_cell = get_target_coordinates(current_pos, target_heading)
@@ -535,9 +451,8 @@ if __name__ == '__main__':
     ep_chassis.sub_position(freq=5, callback=sub_position_handler)
 
     # Start sensor threads
-    analog_ir_reader = threading.Thread(target=read_analog_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
+    # --- (ลบ) การสร้างและเริ่ม analog_ir_reader ---
     digital_ir_reader = threading.Thread(target=read_digital_ir_thread, args=(ep_sensor_adaptor,), daemon=True)
-    analog_ir_reader.start()
     digital_ir_reader.start()
 
     time.sleep(1)
@@ -559,13 +474,10 @@ if __name__ == '__main__':
             print(f"\n--- Current Position: {current_pos}, Heading: {current_heading_degrees}° ---")
 
             if current_pos not in maze_map:
-                map_current_cell() # สร้างแผนที่ของช่องปัจจุบันก่อน
+                map_current_cell()
 
-                # --- LOGIC ใหม่: เช็คว่าเป็นทางแยกหรือทางตันหรือไม่ ---
                 num_open_paths = len(maze_map[current_pos])
-
-                # ทางเดินตรงๆ จะมี 2 ทาง (มาทางนึง ไปทางนึง)
-                # ถ้าไม่ใช่ 2 ทาง แสดงว่าเป็นทางแยก (>=3) หรือทางตัน (<=1)
+                
                 if num_open_paths != 2:
                     print(f"[{current_pos}] เป็นทางแยก/ทางตัน ({num_open_paths} paths), กำลังสแกน Marker...")
                     detect_marker_optimized_scan(ep_camera, ep_gimbal)
@@ -574,17 +486,10 @@ if __name__ == '__main__':
 
                 # plot_maze(walls, visited_nodes, path_stack, current_pos, markers_found)
 
-            # --- [LOGIC การตัดสินใจที่ปรับปรุงใหม่ - ไม่มี Dash Mode] ---
-            
-            # 1. พยายามหาช่องถัดไปที่ยังไม่เคยไป
-            # (แก้ไขการเรียกใช้ find_and_move_to_next_cell ให้ไม่มี ep_camera, ep_gimbal)
             if find_and_move_to_next_cell(controller):
-                # ถ้าเคลื่อนที่สำเร็จ ให้ข้ามไปทำงานรอบถัดไปเลย
                 continue
             
-            # 2. ถ้าไปต่อไม่ได้ (ไม่มีช่องใหม่) ให้ย้อนรอย
             elif not backtrack(controller):
-                # ถ้าการย้อนรอยล้มเหลว (กลับมาถึงจุดเริ่มต้น) ให้จบการทำงาน
                 break
 
     except (KeyboardInterrupt, Exception) as e:
